@@ -32,7 +32,7 @@ fn session_command(session: &str) -> String {
     let home = home();
     match session {
         "spotify" => format!("{home}/ssd/tui/spotatui/target/release/spotatui"),
-        "shorts" => format!("cd {home}/ssd/tools/dopagaki && cargo run --release"),
+        "shorts" => format!("{home}/ssd/tools/dopagaki/target/release/dopagaki standalone"),
         "bluetooth" => "bluetoothctl".to_string(),
         "ssbrowse" => format!("cd {home}/ssd/ssbrowse && npm run browser:auto"),
         _ => unreachable!("未知のセッション {session}"),
