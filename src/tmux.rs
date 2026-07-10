@@ -70,6 +70,11 @@ pub fn new_session(name: &str, cmd: &str) -> Result<()> {
 }
 
 /// セッション内に新規ウィンドウを作ってコマンドを実行する(作成後そのウィンドウが選択される)。
+///
+/// -t は末尾コロン付き(`name:`)でセッション指定を明示する。tmux の自動命名
+/// セッション("4" や "66" など数値名)を裸で渡すと target-window の
+/// 「現セッションのウィンドウ index」と解釈され、その index が使用中だと
+/// "create window failed: index N in use" で失敗する(空いていれば偶然成功する)。
 pub fn new_window(session: &str, cmd: &str) -> Result<()> {
-    run_checked(&["new-window", "-t", session, cmd])
+    run_checked(&["new-window", "-t", &format!("{session}:"), cmd])
 }
