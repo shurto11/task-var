@@ -29,14 +29,26 @@ pub struct State {
     pub current: Option<String>,
     /// 存在する全セッション名。
     pub existing: Vec<String>,
+    /// 存在するセッションのうち最も古い(作成が最初の)もの。
+    /// アイコン起動セッションがプログラム終了で破棄されたときの復帰先に使う。
+    pub first_session: Option<String>,
 }
 
 impl State {
     /// tmux から現在の状態を取得する。tmux サーバー不在時は全て空。
     pub fn poll() -> Self {
         let mut st = State::default();
-        if let Some(out) = run(&["list-sessions", "-F", "#S"]) {
-            st.existing = out.lines().map(str::to_string).collect();
+        if let Some(out) = run(&["list-sessions", "-F", "#{session_created} #{session_name}"]) {
+            let mut sessions: Vec<(i64, String)> = out
+                .lines()
+                .filter_map(|l| {
+                    let (created, name) = l.split_once(' ')?;
+                    Some((created.parse().ok()?, name.to_string()))
+                })
+                .collect();
+            sessions.sort_by_key(|(created, _)| *created);
+            st.first_session = sessions.first().map(|(_, name)| name.clone());
+            st.existing = sessions.into_iter().map(|(_, name)| name).collect();
         }
         if let Some((name, session)) = fbterm_client() {
             st.client = Some(name);
@@ -65,8 +77,20 @@ pub fn switch(client: &str, session: &str) -> Result<()> {
 }
 
 /// デタッチ状態で新規セッションを作り、コマンドを実行する(cmd はシェル経由)。
+///
+/// 作成したセッション単体に detach-on-destroy off を設定する。既定(on)だと
+/// このセッションを表示中にコマンドが終了した際、fbterm クライアントごと
+/// デタッチ(tmux 終了)してしまうため。実際にどのセッションへ表示を戻すかは
+/// main.rs のポーリングループが明示的に switch-client で決める。
 pub fn new_session(name: &str, cmd: &str) -> Result<()> {
-    run_checked(&["new-session", "-d", "-s", name, cmd])
+    run_checked(&["new-session", "-d", "-s", name, cmd])?;
+    // 起動直後にコマンドが即終了してセッションが既に無い場合はここで失敗しうる
+    // (即クラッシュするプログラムなど)。detach-on-destroy はもう手遅れなだけなので
+    // 後続の switch に処理を進め、そちらの失敗で実際の原因を伝える。
+    if let Err(e) = run_checked(&["set-option", "-t", name, "detach-on-destroy", "off"]) {
+        eprintln!("task-var: {name} の detach-on-destroy 設定に失敗(起動直後に終了した可能性): {e:#}");
+    }
+    Ok(())
 }
 
 /// セッション内に新規ウィンドウを作ってコマンドを実行する(作成後そのウィンドウが選択される)。

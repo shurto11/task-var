@@ -96,8 +96,26 @@ fn main() -> Result<()> {
                 fb.blit(0, bar_y, screen_w, bar_h, &buf)?;
             }
             Err(mpsc::RecvTimeoutError::Timeout) | Err(mpsc::RecvTimeoutError::Disconnected) => {
-                let s = tmux::State::poll();
+                let mut s = tmux::State::poll();
                 if s != state {
+                    // 表示中だったセッションが消えていたら(=起動プログラムの終了で破棄)、
+                    // tmux の自動切替先(直近アクティブなセッション)ではなく
+                    // 明示的に1番目のセッションへ復帰させる。
+                    let destroyed = state.current.as_deref().is_some_and(|cur| {
+                        state.existing.iter().any(|e| e == cur)
+                            && !s.existing.iter().any(|e| e == cur)
+                    });
+                    if destroyed {
+                        if let (Some(client), Some(first)) = (s.client.clone(), s.first_session.clone()) {
+                            if s.current.as_deref() != Some(first.as_str()) {
+                                eprintln!("task-var: セッション破棄を検知、1番目のセッション {first} へ復帰");
+                                match tmux::switch(&client, &first) {
+                                    Ok(()) => s.current = Some(first),
+                                    Err(e) => eprintln!("task-var: 復帰switchに失敗: {e:#}"),
+                                }
+                            }
+                        }
+                    }
                     state = s;
                     bar.draw(&mut buf, &state);
                 }

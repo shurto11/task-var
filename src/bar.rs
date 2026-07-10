@@ -150,6 +150,7 @@ mod tests {
             client: Some("/dev/tty1".into()),
             current: Some(current.into()),
             existing: existing.iter().map(|s| s.to_string()).collect(),
+            first_session: existing.first().map(|s| s.to_string()),
         }
     }
 
