@@ -8,12 +8,14 @@ dir="$(cd "$(dirname "$0")/.." && pwd)/assets"
 mkdir -p "$dir"
 
 # 表示名:slug (ssbrowse はブランドが無いので googlechrome を代替に使う)
+# eduroam は Simple Icons に無いため assets/eduroam.svg を手書きで同梱している(上書きしない)
 icons=(
     "tmux:tmux"
     "spotify:spotify"
     "shorts:youtubeshorts"
     "bluetooth:bluetooth"
     "ssbrowse:googlechrome"
+    "calendar:googlecalendar"
 )
 
 for entry in "${icons[@]}"; do

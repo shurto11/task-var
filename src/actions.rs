@@ -15,12 +15,14 @@ pub struct IconDef {
     pub svg: &'static [u8],
 }
 
-pub const ICONS: [IconDef; 5] = [
+pub const ICONS: [IconDef; 7] = [
     IconDef { name: "tmux", session: None, svg: include_bytes!("../assets/tmux.svg") },
     IconDef { name: "spotify", session: Some("spotify"), svg: include_bytes!("../assets/spotify.svg") },
     IconDef { name: "shorts", session: Some("shorts"), svg: include_bytes!("../assets/shorts.svg") },
     IconDef { name: "bluetooth", session: Some("bluetooth"), svg: include_bytes!("../assets/bluetooth.svg") },
     IconDef { name: "ssbrowse", session: Some("ssbrowse"), svg: include_bytes!("../assets/ssbrowse.svg") },
+    IconDef { name: "eduroam", session: Some("eduroam"), svg: include_bytes!("../assets/eduroam.svg") },
+    IconDef { name: "calendar", session: Some("calendar"), svg: include_bytes!("../assets/calendar.svg") },
 ];
 
 fn home() -> String {
@@ -35,6 +37,14 @@ fn session_command(session: &str) -> String {
         "shorts" => format!("{home}/ssd/tools/dopagaki/target/release/dopagaki standalone"),
         "bluetooth" => "bluetoothctl".to_string(),
         "ssbrowse" => format!("cd {home}/ssd/ssbrowse && npm run browser:auto"),
+        // eduroam は ~/.bashrc の関数(sudo wpa_supplicant ...)なので対話bash経由で呼ぶ
+        "eduroam" => "bash -ic eduroam".to_string(),
+        // calendar-tui は credentials.json をカレントディレクトリから探すため、
+        // 自身のディレクトリへ cd してから起動する(tmux new-session の既定cwdは
+        // task-var 自身のディレクトリを継承してしまうため)。
+        "calendar" => format!(
+            "cd {home}/ssd/tui/calendar-tui && {home}/ssd/tui/calendar-tui/target/release/calendar-tui"
+        ),
         _ => unreachable!("未知のセッション {session}"),
     }
 }
