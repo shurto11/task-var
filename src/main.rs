@@ -11,6 +11,7 @@
 mod actions;
 mod bar;
 mod fb;
+mod fb_client;
 mod icons;
 mod term;
 mod tmux;
@@ -58,7 +59,10 @@ fn main() -> Result<()> {
     let mut buf = vec![0u8; (screen_w * bar_h * 4) as usize];
     let mut state = tmux::State::poll();
     bar.draw(&mut buf, &state);
-    fb.blit(0, bar_y, screen_w, bar_h, &buf)?;
+    let mut visible = true;
+    if visible {
+        fb.blit(0, bar_y, screen_w, bar_h, &buf)?;
+    }
 
     // touch-server クライアント起動(バー矩形を region として申告)
     let region = FracRect {
@@ -70,12 +74,24 @@ fn main() -> Result<()> {
     let (tx, rx) = mpsc::channel::<touch_client::Up>();
     touch_client::spawn(region, tx);
 
+    // fb-server クライアント起動(表示可否の通知を受け取る)
+    let (vtx, vrx) = mpsc::channel::<bool>();
+    fb_client::spawn("task-var", vtx);
+
     eprintln!(
         "task-var: 起動 (論理画面 {screen_w}x{screen_h}, 回転 {}, バー領域 y={bar_y} h={bar_h})",
         fb.rotate
     );
 
     loop {
+        // fb-server からの可視性通知を反映(非表示に変わった瞬間だけ1回クリア)
+        while let Ok(v) = vrx.try_recv() {
+            if visible && !v {
+                let _ = fb.clear(0, bar_y, screen_w, bar_h);
+            }
+            visible = v;
+        }
+
         match rx.recv_timeout(Duration::from_secs(1)) {
             Ok(up) => {
                 // タップ判定: 始点→終点の移動が小さいこと
@@ -93,7 +109,9 @@ fn main() -> Result<()> {
                 // タップ直後は状態が変わっているはずなので即時更新
                 state = tmux::State::poll();
                 bar.draw(&mut buf, &state);
-                fb.blit(0, bar_y, screen_w, bar_h, &buf)?;
+                if visible {
+                    fb.blit(0, bar_y, screen_w, bar_h, &buf)?;
+                }
             }
             Err(mpsc::RecvTimeoutError::Timeout) | Err(mpsc::RecvTimeoutError::Disconnected) => {
                 let mut s = tmux::State::poll();
@@ -120,7 +138,9 @@ fn main() -> Result<()> {
                     bar.draw(&mut buf, &state);
                 }
                 // 状態が同じでも再ブリット(fbterm 再描画で消された場合の復活)
-                fb.blit(0, bar_y, screen_w, bar_h, &buf)?;
+                if visible {
+                    fb.blit(0, bar_y, screen_w, bar_h, &buf)?;
+                }
             }
         }
     }

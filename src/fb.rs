@@ -110,6 +110,14 @@ impl Framebuffer {
         Ok(())
     }
 
+    /// 論理座標の矩形(x,y,w,h)を黒(不透明)で塗りつぶす。
+    /// fb-server から visible=false を受け取った際、非表示遷移時の
+    /// 描画領域クリアに使う。
+    pub fn clear(&self, x: u32, y: u32, w: u32, h: u32) -> Result<()> {
+        let buf = vec![0u8; (w as usize) * (h as usize) * 4];
+        self.blit(x, y, w, h, &buf)
+    }
+
     fn clamp(&self, x: u32, y: u32, w: u32, h: u32) -> (u32, u32, u32, u32) {
         let x = x.min(self.width);
         let y = y.min(self.height);
