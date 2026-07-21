@@ -110,6 +110,17 @@ impl Framebuffer {
         Ok(())
     }
 
+    /// 論理矩形 (x,y,w,h) が物理 fb 上で実際に占める矩形。fb-server の重なり
+    /// 調停は物理 fb 座標で行うため、rect 申告にはこの変換後の値を使う。
+    pub fn phys_region(&self, x: u32, y: u32, w: u32, h: u32) -> (u32, u32, u32, u32) {
+        let (x, y, w, h) = self.clamp(x, y, w, h);
+        if self.rotate == 0 {
+            (x, y, w, h)
+        } else {
+            phys_rect(self.rotate, self.width, self.height, x, y, w, h)
+        }
+    }
+
     /// 論理座標の矩形(x,y,w,h)を黒(不透明)で塗りつぶす。
     /// fb-server から visible=false を受け取った際、非表示遷移時の
     /// 描画領域クリアに使う。

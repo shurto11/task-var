@@ -74,9 +74,12 @@ fn main() -> Result<()> {
     let (tx, rx) = mpsc::channel::<touch_client::Up>();
     touch_client::spawn(region, tx);
 
-    // fb-server クライアント起動(表示可否の通知を受け取る)
+    // fb-server クライアント起動(表示可否の通知を受け取る)。
+    // バーの描画領域(物理 fb 座標)を申告し、下位レイヤーに避けさせる。
+    let (bx, by, bw, bh) = fb.phys_region(0, bar_y, screen_w, bar_h);
+    let bar_rect = Some(fb_client::Rect { x: bx, y: by, w: bw, h: bh });
     let (vtx, vrx) = mpsc::channel::<bool>();
-    fb_client::spawn("task-var", vtx);
+    fb_client::spawn("task-var", bar_rect, vtx);
 
     eprintln!(
         "task-var: 起動 (論理画面 {screen_w}x{screen_h}, 回転 {}, バー領域 y={bar_y} h={bar_h})",

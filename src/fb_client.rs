@@ -10,10 +10,23 @@ use std::os::unix::net::UnixStream;
 use std::sync::mpsc::Sender;
 use std::time::Duration;
 
+/// フレームバッファ上の矩形(ピクセル座標、左上原点)。fb-server の重なり調停用。
+#[derive(Serialize, Clone, Copy)]
+pub struct Rect {
+    pub x: u32,
+    pub y: u32,
+    pub w: u32,
+    pub h: u32,
+}
+
 /// 接続直後に1行だけ送る申告メッセージ。
+/// `rect` を申告すると、fb-server が下位レイヤーへ「この矩形を避けて描け」と
+/// 伝える(task-var のバーは固定領域なので接続時に一度だけ申告する)。
 #[derive(Serialize)]
 struct Hello {
     hello: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    rect: Option<Rect>,
 }
 
 /// サーバーから届く可視性通知。
@@ -37,9 +50,9 @@ fn socket_path() -> String {
 
 /// fb-client スレッドを起動する(detached)。切断・接続失敗時は再接続し続ける。
 /// fb-server が起動していない間は既定で visible=true のまま(main 側の初期値に従う)。
-pub fn spawn(name: &'static str, tx: Sender<bool>) {
+pub fn spawn(name: &'static str, rect: Option<Rect>, tx: Sender<bool>) {
     std::thread::spawn(move || loop {
-        if let Err(e) = session(name, &tx) {
+        if let Err(e) = session(name, rect, &tx) {
             eprintln!("task-var: fb-server 接続待ち ({e})");
         }
         std::thread::sleep(Duration::from_millis(500));
@@ -47,9 +60,9 @@ pub fn spawn(name: &'static str, tx: Sender<bool>) {
 }
 
 /// 1接続ぶんの受信ループ。EOF / エラーで戻る(呼び出し側が張り直す)。
-fn session(name: &'static str, tx: &Sender<bool>) -> std::io::Result<()> {
+fn session(name: &'static str, rect: Option<Rect>, tx: &Sender<bool>) -> std::io::Result<()> {
     let stream = UnixStream::connect(socket_path())?;
-    let hello = Hello { hello: name };
+    let hello = Hello { hello: name, rect };
     let line = serde_json::to_string(&hello).unwrap_or_default();
     (&stream).write_all(format!("{line}\n").as_bytes())?;
     stream.set_read_timeout(Some(Duration::from_millis(500)))?;
