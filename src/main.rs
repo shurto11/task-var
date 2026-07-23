@@ -4,10 +4,11 @@
 //! - タッチ入力は touch-server から受け取る(バー矩形を region として申告)
 //! - アイコンタップで対応 tmux セッションへ遷移(なければ作成してプログラム実行)
 //! - 通常は端末行数を縮めてバー領域を専有し、終了時に復元する(touch-key と同方式)
-//! - fbhalf シーンの間は「スワイプ表示モード」: 端末縮小を解除して全高を明け渡し、
-//!   バーは既定で隠す。下部ストリップの上スワイプで 3 秒だけバーを出す。表示中は
-//!   fb-server へバー矩形を申告し、fbhalf にその領域を clip で避けさせる(重ねても
-//!   チカチカしない)。3 秒無操作、または fbhalf 終了で隠す。
+//! - 全画面クライアントのシーン(`SWIPE_SCENES`: fbhalf / ssbrowse)の間は
+//!   「スワイプ表示モード」: 端末縮小を解除して全高を明け渡し、バーは既定で隠す。
+//!   画面下端の上スワイプで 3 秒だけバーを出す。表示中は fb-server へバー矩形を
+//!   申告し、clip 対応クライアント(fbhalf)にはその領域を避けさせる(重ねても
+//!   チカチカしない)。3 秒無操作、またはシーン終了で隠す。
 //! - セッション状態は 1 秒間隔でポーリングし、リング色(青=表示中 / 灰=存在)を更新。
 //!   ポーリングごとに再ブリットするため、fbterm の再描画で消されても 1 秒以内に復活する
 //!   (tmux-session スイッチャー実行中は SIGSTOP で止められる想定)
@@ -33,8 +34,10 @@ const TAP_FRAC: f64 = 0.05;
 /// スワイプ表示モードで「上スワイプ」とみなす最小の上向き移動量(画面高に対する割合)。
 const SWIPE_UP_FRAC: f64 = 0.05;
 
-/// スワイプ表示モードでバーを出す対象シーン名(fb-server の scene と一致比較)。
-const SWIPE_SCENE: &str = "fbhalf";
+/// スワイプ表示モードにする対象シーン名(fb-server の scene と一致比較)。
+/// これらのシーンでは全画面クライアントに画面を明け渡し、バーは下端からの
+/// 上スワイプでだけ一時表示する。
+const SWIPE_SCENES: &[&str] = &["fbhalf", "ssbrowse"];
 
 /// スワイプ表示したバーを、無操作で自動的に隠すまでの時間。
 const HIDE_AFTER: Duration = Duration::from_secs(3);
@@ -170,7 +173,7 @@ fn main() -> Result<()> {
     loop {
         // fb-server からの通知を反映。scene によりモードを切り替える。
         while let Ok(msg) = vrx.try_recv() {
-            let now_swipe = msg.scene.as_deref() == Some(SWIPE_SCENE);
+            let now_swipe = msg.scene.as_deref().is_some_and(|s| SWIPE_SCENES.contains(&s));
             if now_swipe != swipe_mode {
                 swipe_mode = now_swipe;
                 if swipe_mode {
