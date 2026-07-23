@@ -39,6 +39,14 @@ const SWIPE_SCENE: &str = "fbhalf";
 /// スワイプ表示したバーを、無操作で自動的に隠すまでの時間。
 const HIDE_AFTER: Duration = Duration::from_secs(3);
 
+/// バー非表示中に「上スワイプ」を待ち受ける画面下端の帯の高さ(画面高に対する割合)。
+/// ここだけを task-var が占有し、残りは fbhalf 等が受け取れるようにする。
+const SWIPE_ZONE_FRAC: f64 = 0.06;
+
+/// touch-server へ申告する region の優先度。後から起動する全画面クライアント
+/// (fbhalf 等)より上に描くので、重なった領域のタッチはこちらが受け取る。
+const TOUCH_PRIORITY: i32 = 10;
+
 fn env_u32(name: &str, default: u32) -> u32 {
     std::env::var(name).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
 }
@@ -80,16 +88,24 @@ fn main() -> Result<()> {
     let mut state = tmux::State::poll();
     bar.draw(&mut buf, &state);
 
-    // touch-server クライアント起動(下部ストリップを region として申告)。
-    // スワイプ表示モードでも、この領域で上スワイプを受けるため常に登録しておく。
-    let region = FracRect {
+    // touch-server クライアント起動。バー表示中は帯全体、非表示中は下端だけを
+    // region として申告する(残りは fbhalf 等が受け取れる)。優先度を付けて、
+    // 後から起動する全画面クライアントにバー領域のタッチを奪われないようにする。
+    let bar_region = FracRect {
         left: 0.0,
         top: bar_y as f64 / screen_h as f64,
         right: 1.0,
         bottom: 1.0,
     };
+    let swipe_region = FracRect { left: 0.0, top: 1.0 - SWIPE_ZONE_FRAC, right: 1.0, bottom: 1.0 };
+    let touch_region = Arc::new(Mutex::new(bar_region));
     let (tx, rx) = mpsc::channel::<touch_client::Up>();
-    touch_client::spawn(region, tx);
+    touch_client::spawn(touch_region.clone(), TOUCH_PRIORITY, tx);
+
+    // バーの表示状態に合わせてタッチ領域を切り替える。
+    let set_touch_region = |shown: bool| {
+        *touch_region.lock().unwrap() = if shown { bar_region } else { swipe_region };
+    };
 
     // fb-server クライアント起動。バーの描画領域(物理 fb 座標)を、バーを実際に
     // 表示している間だけ申告する(下位レイヤー = fbhalf にその矩形を避けさせる)。
@@ -118,16 +134,19 @@ fn main() -> Result<()> {
     // 初期状態を描画(通常モードで可視)
     fb.blit(0, bar_y, screen_w, bar_h, &buf)?;
 
-    // バーを表示する(rect 申告 + 描画)。
+    // バーを表示する(rect 申告 + タッチ領域を帯全体へ + 描画)。
     let show_bar = |fb: &fb::Framebuffer, buf: &[u8]| -> Result<()> {
         set_rect(true);
+        set_touch_region(true);
         fb.blit(0, bar_y, screen_w, bar_h, buf)?;
         Ok(())
     };
     // バーを隠す。通常モードでは黒クリア。スワイプモードでは rect を取り消して
     // fbhalf に再描画で埋めさせる(黒フラッシュを避ける)。
+    // タッチ領域はスワイプ検知用の下端だけに縮める。
     let hide_bar = |fb: &fb::Framebuffer, in_swipe: bool| -> Result<()> {
         set_rect(false);
+        set_touch_region(false);
         if !in_swipe {
             let _ = fb.clear(0, bar_y, screen_w, bar_h);
         }

@@ -2,16 +2,22 @@
 //!
 //! タスクバーの占有領域(画面下部)を region として touch-server に申告し、その
 //! 矩形内で起きたタッチのうち up だけを `Tap` 判定用に main へ渡す。
+//!
+//! region は共有(`Arc<Mutex<FracRect>>`)で、main が書き換えると張り直して
+//! 申告し直す(バー表示中は帯全体、非表示中はスワイプ検知用の下端だけ)。
+//! `priority` を申告することで、後から起動した全画面クライアント(fbhalf 等)に
+//! バー領域のタッチを奪われないようにする。
 //! (Hello 送信 → set_read_timeout → chunk 読み → \n 区切り JSON → 切断で張り直し)
 
 use serde::{Deserialize, Serialize};
 use std::io::{ErrorKind, Read, Write};
 use std::os::unix::net::UnixStream;
 use std::sync::mpsc::Sender;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 /// 画面に対する 0..1 の割合で表した矩形(touch-server の FracRect に対応)。
-#[derive(Serialize, Clone, Copy)]
+#[derive(Serialize, Clone, Copy, PartialEq)]
 pub struct FracRect {
     pub left: f64,
     pub top: f64,
@@ -25,6 +31,8 @@ struct Hello {
     hello: &'static str,
     pane: Option<String>,
     region: Option<FracRect>,
+    /// region が重なったときの優先度(既定 0、大きいほど優先)。
+    priority: i32,
 }
 
 /// サーバーから届くイベント。up の始点・終点だけ使う。
@@ -65,26 +73,34 @@ fn socket_path() -> String {
 }
 
 /// touch-client スレッドを起動する(detached)。切断・接続失敗時は再接続し続ける。
-pub fn spawn(region: FracRect, tx: Sender<Up>) {
+/// `region` は共有。main が書き換えると張り直して新しい矩形で申告し直す。
+pub fn spawn(region: Arc<Mutex<FracRect>>, priority: i32, tx: Sender<Up>) {
     std::thread::spawn(move || loop {
-        if let Err(e) = session(region, &tx) {
-            eprintln!("task-var: touch-server 接続待ち ({e})");
+        match session(&region, priority, &tx) {
+            Err(e) => {
+                eprintln!("task-var: touch-server 接続待ち ({e})");
+                std::thread::sleep(Duration::from_millis(500));
+            }
+            // region 変更による張り直しは素早く(バー表示直後のタップを取りこぼさない)
+            Ok(()) => std::thread::sleep(Duration::from_millis(50)),
         }
-        std::thread::sleep(Duration::from_millis(500));
     });
 }
 
-/// 1 接続ぶんの受信ループ。EOF / エラーで戻る(呼び出し側が張り直す)。
-fn session(region: FracRect, tx: &Sender<Up>) -> std::io::Result<()> {
+/// 1 接続ぶんの受信ループ。EOF / エラー / region 変更で戻る(呼び出し側が張り直す)。
+fn session(region: &Arc<Mutex<FracRect>>, priority: i32, tx: &Sender<Up>) -> std::io::Result<()> {
+    let declared = *region.lock().unwrap();
     let stream = UnixStream::connect(socket_path())?;
     let hello = Hello {
         hello: "task-var",
         pane: std::env::var("TMUX_PANE").ok(),
-        region: Some(region),
+        region: Some(declared),
+        priority,
     };
     let line = serde_json::to_string(&hello).unwrap_or_default();
     (&stream).write_all(format!("{line}\n").as_bytes())?;
-    stream.set_read_timeout(Some(Duration::from_millis(500)))?;
+    // region 変更を検知するため、ブロックしっぱなしにせず定期的に起こす
+    stream.set_read_timeout(Some(Duration::from_millis(100)))?;
 
     let mut buf: Vec<u8> = Vec::new();
     let mut chunk = [0u8; 1024];
@@ -104,7 +120,10 @@ fn session(region: FracRect, tx: &Sender<Up>) -> std::io::Result<()> {
                 }
             }
             Err(e) if e.kind() == ErrorKind::WouldBlock || e.kind() == ErrorKind::TimedOut => {
-                // タイムアウトは何もせず継続(再接続判定用の周期起こしのみ)
+                // region が変わっていたら、新しい矩形で申告し直す(張り直し)
+                if *region.lock().unwrap() != declared {
+                    return Ok(());
+                }
             }
             Err(e) => return Err(e),
         }
