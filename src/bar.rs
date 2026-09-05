@@ -64,6 +64,11 @@ fn env_u32(name: &str, default: u32) -> u32 {
     std::env::var(name).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
 }
 
+/// 指定があるときだけ Some。既定を持たない上書き用の env var に使う。
+fn env_opt_u32(name: &str) -> Option<u32> {
+    std::env::var(name).ok().and_then(|v| v.trim().parse().ok()).filter(|v| *v > 0)
+}
+
 /// 文字サイズ用。0 以下や解析できない値は既定へ落とす。
 fn env_f32(name: &str, default: f32) -> f32 {
     std::env::var(name)
@@ -111,35 +116,57 @@ struct NpLayout {
     artist_px: f32,
 }
 
+const MARGIN: u32 = 12; // 画面右端からの余白
+const INSET: u32 = 4; // バー上下からの余白
+const PAD: u32 = 8; // パネル内側の余白
+const GAP: u32 = 12; // 列間
+const BTN_GAP: u32 = 10;
+
+/// パネルの幅を決める。
+///
+/// 既定はパネル幅(`np_w`)が主で、列②(曲名・アーティスト)はその余りを取る。
+/// `text_w` が指定されたときは列②を主にし、パネル幅の方を逆算する。
+/// どちらの場合も、アイコン列に重ならない範囲 `avail` で頭打ちにする。
+fn panel_width(avail: u32, np_w: u32, text_w: Option<u32>, art: u32, col3: u32) -> u32 {
+    match text_w {
+        Some(t) => PAD * 2 + art + GAP + t + GAP + col3,
+        None => np_w,
+    }
+    .min(avail)
+}
+
 impl NpLayout {
     /// バー幅 w・高さ h と、アイコン列の右端 icons_right から算出する。
     /// パネルがアイコンに重ならないよう幅を切り詰める。
     fn new(w: u32, h: u32, icons_right: u32) -> Self {
-        const MARGIN: u32 = 12; // 画面右端からの余白
-        const INSET: u32 = 4; // バー上下からの余白
-        const PAD: u32 = 8; // パネル内側の余白
-        const GAP: u32 = 12; // 列間
-        const BTN_GAP: u32 = 10;
-
-        let avail = w.saturating_sub(MARGIN).saturating_sub(icons_right + GAP);
-        let panel_w = env_u32("TASKVAR_NP_W", 560).min(avail);
         let panel_h = h.saturating_sub(INSET * 2);
+        let content_h = panel_h - PAD * 2;
+
+        // 列①のアルバムアートは行をぶち抜く正方形、列③はボタン 5 個ぶん。
+        // この 2 つは先に決まるので、パネル幅はそこから逆算できる。
+        let want_btn = env_u32("TASKVAR_BTN_D", 32);
+        let want_col3 = want_btn * 5 + BTN_GAP * 4;
+        let avail = w.saturating_sub(MARGIN).saturating_sub(icons_right + GAP);
+        let panel_w = panel_width(
+            avail,
+            env_u32("TASKVAR_NP_W", 560),
+            env_opt_u32("TASKVAR_TEXT_W"),
+            content_h,
+            want_col3,
+        );
         let panel = Rect { x: w - MARGIN - panel_w, y: INSET, w: panel_w, h: panel_h };
 
-        let content_h = panel_h - PAD * 2;
         let content_x = panel.x + PAD;
         let content_y = panel.y + PAD;
         let content_w = panel_w - PAD * 2;
 
-        // 列①: アルバムアートは行をぶち抜く正方形。
         let art_side = content_h.min(content_w);
         let art = Rect { x: content_x, y: content_y, w: art_side, h: art_side };
 
         // 列②③はアートの右の残り。パネルが狭いときは列③(ボタン)を先に確保し、
         // ボタンも入らないほど狭ければボタン自体を縮める。列②は最後に余りを取る。
         let rest = content_w.saturating_sub(art.w + GAP);
-        let want_btn = env_u32("TASKVAR_BTN_D", 32);
-        let col3_w = (want_btn * 5 + BTN_GAP * 4).min(rest.saturating_sub(GAP));
+        let col3_w = want_col3.min(rest.saturating_sub(GAP));
         let btn_d = want_btn.min(col3_w.saturating_sub(BTN_GAP * 4) / 5);
         let col2_w = rest.saturating_sub(GAP + col3_w);
         let col2_x = art.x + art.w + GAP;
@@ -689,6 +716,23 @@ mod tests {
         }
         std::env::remove_var(K);
         assert_eq!(env_f32(K, 7.0), 7.0);
+    }
+
+    #[test]
+    fn text_width_drives_the_panel_when_given() {
+        // 列②に 300px を指定 → その幅ちょうどになるパネル幅が返る
+        let want = PAD * 2 + 72 + GAP + 300 + GAP + 200;
+        assert_eq!(panel_width(2000, 560, Some(300), 72, 200), want);
+        // 実際にレイアウトへ通しても列②は 300px
+        let l = NpLayout::new(1366, 96, 24 + 592);
+        let text_w = l.col2_w; // 既定(TASKVAR_NP_W=560)の余り
+        assert_eq!(text_w, 560 - PAD * 2 - 72 - GAP - GAP - 200);
+
+        // 使える幅に収まらなければそこで頭打ち
+        assert_eq!(panel_width(400, 560, Some(300), 72, 200), 400);
+        // 未指定ならパネル幅が主(こちらも avail で頭打ち)
+        assert_eq!(panel_width(2000, 560, None, 72, 200), 560);
+        assert_eq!(panel_width(400, 560, None, 72, 200), 400);
     }
 
     #[test]
