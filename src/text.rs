@@ -62,6 +62,19 @@ impl Font {
         text.chars().map(|c| sf.h_advance(sf.glyph_id(c))).sum()
     }
 
+    /// `max_px` に収まる最大の文字サイズを返す。`preferred` は超えず、`min` は下回らない。
+    ///
+    /// ab_glyph の送り幅は指定サイズに正比例するので、収まらない場合の縮小率は
+    /// 幅の比からそのまま求まる(二分探索は要らない)。
+    pub fn shrink_to_fit(&self, text: &str, max_px: f32, preferred: f32, min: f32) -> f32 {
+        let w = self.width(text, preferred);
+        if w <= max_px || w <= 0.0 {
+            return preferred;
+        }
+        // 浮動小数の誤差でぎりぎり溢れないよう少しだけ内側に取る
+        (preferred * max_px / w * 0.999).clamp(min.min(preferred), preferred)
+    }
+
     /// `max_px` に収まるよう末尾を `…` で切り詰める。
     pub fn fit(&self, text: &str, max_px: f32, px: f32) -> String {
         if self.width(text, px) <= max_px {
@@ -138,6 +151,27 @@ impl Font {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shrink_to_fit_scales_down_only_when_needed() {
+        let Some(font) = Font::load() else {
+            eprintln!("フォントが無い環境なのでスキップ");
+            return;
+        };
+        let text = "I mean, It's about time";
+        let full = font.width(text, 28.0);
+
+        // 収まるなら既定サイズのまま
+        assert_eq!(font.shrink_to_fit(text, full + 1.0, 28.0, 14.0), 28.0);
+
+        // 収まらないなら、その幅にちょうど収まるところまで縮める
+        let px = font.shrink_to_fit(text, full * 0.6, 28.0, 8.0);
+        assert!(px < 28.0, "縮んでいない: {px}");
+        assert!(font.width(text, px) <= full * 0.6, "縮めても収まっていない");
+
+        // 下限より下へは行かない(そこは呼び出し側が … で詰める)
+        assert_eq!(font.shrink_to_fit(text, 1.0, 28.0, 15.0), 15.0);
+    }
 
     #[test]
     fn fit_truncates_with_an_ellipsis() {
