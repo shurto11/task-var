@@ -57,6 +57,16 @@ const CTRL_SVGS: [&[u8]; 7] = [
 pub const CTRLS: [Ctrl; 5] =
     [Ctrl::Shuffle, Ctrl::Prev, Ctrl::PlayPause, Ctrl::Next, Ctrl::Repeat];
 
+/// ボタンごとの大きさを指定する env var。並びは `CTRLS` と揃える。
+/// 未指定のものは `TASKVAR_BTN_D`(全体の既定)へ落ちる。
+const BTN_ENV: [&str; 5] = [
+    "TASKVAR_BTN_D_SHUFFLE",
+    "TASKVAR_BTN_D_PREV",
+    "TASKVAR_BTN_D_PLAY",
+    "TASKVAR_BTN_D_NEXT",
+    "TASKVAR_BTN_D_REPEAT",
+];
+
 /// 再生/停止グリフは白円の中に入れるので、他より小さく描く。
 const PLAY_GLYPH_PCT: u32 = 58;
 
@@ -102,15 +112,15 @@ struct NpLayout {
     art: Rect,
     col2_x: u32,
     col2_w: u32,
-    col3_x: u32,
-    col3_w: u32,
     row1_y: u32,
     row1_h: u32,
     row2_y: u32,
     row2_h: u32,
-    btn_d: u32,
+    /// 各ボタンの一辺。並びは `CTRLS` と同じ。
+    btn_d: [u32; 5],
     btn_xs: [u32; 5],
-    btn_y: u32,
+    /// 各ボタンの上端。大きさが違っても上段の行の中央に揃える。
+    btn_y: [u32; 5],
     prog: Rect,
     title_px: f32,
     artist_px: f32,
@@ -148,8 +158,10 @@ impl NpLayout {
         // 列①のアルバムアートは行をぶち抜く正方形、列③はボタン 5 個ぶん。
         // この 2 つは先に決まるので、パネル幅はそこから逆算できる。
         // ボタンは自分の行に収まる大きさまで(2x3 グリッドの升目をはみ出さない)。
-        let want_btn = env_u32("TASKVAR_BTN_D", 32).min(row1_h);
-        let want_col3 = want_btn * 5 + BTN_GAP * 4;
+        let base = env_u32("TASKVAR_BTN_D", 32);
+        let want: [u32; 5] =
+            std::array::from_fn(|i| env_opt_u32(BTN_ENV[i]).unwrap_or(base).min(row1_h));
+        let want_col3 = want.iter().sum::<u32>() + BTN_GAP * 4;
         let avail = w.saturating_sub(MARGIN).saturating_sub(icons_right + GAP);
         let panel_w = panel_width(
             avail,
@@ -171,31 +183,46 @@ impl NpLayout {
         // ボタンも入らないほど狭ければボタン自体を縮める。列②は最後に余りを取る。
         let rest = content_w.saturating_sub(art.w + GAP);
         let col3_w = want_col3.min(rest.saturating_sub(GAP));
-        let btn_d = want_btn.min(col3_w.saturating_sub(BTN_GAP * 4) / 5);
+        // 入りきらないときは 5 つとも同じ比率で詰める(大小関係は保つ)。
+        let btn_d = if col3_w < want_col3 {
+            let usable = col3_w.saturating_sub(BTN_GAP * 4);
+            let total = want.iter().sum::<u32>().max(1);
+            want.map(|d| d * usable / total)
+        } else {
+            want
+        };
         let col2_w = rest.saturating_sub(GAP + col3_w);
         let col2_x = art.x + art.w + GAP;
         let col3_x = col2_x + col2_w + GAP;
         let (row1_y, row2_y) = (content_y, content_y + row1_h);
 
-        let btn_y = row1_y + (row1_h.saturating_sub(btn_d)) / 2;
+        let btn_y = btn_d.map(|d| row1_y + (row1_h.saturating_sub(d)) / 2);
+        // 並べる位置。列③に入りきらないほど狭いときは右端で止めて、
+        // ボタンがパネルの外へ出ないようにする。
+        let col3_right = col3_x + col3_w;
         let mut btn_xs = [0u32; 5];
-        for (i, x) in btn_xs.iter_mut().enumerate() {
-            *x = col3_x + i as u32 * (btn_d + BTN_GAP);
+        let mut x = col3_x;
+        for (i, slot) in btn_xs.iter_mut().enumerate() {
+            *slot = x.min(col3_right.saturating_sub(btn_d[i]));
+            x += btn_d[i] + BTN_GAP;
         }
 
         // 進捗バーはボタン列と同じ幅で、下段の行の中央に置く。
         // 高さは env `TASKVAR_PROG_H` で調整できる(こちらも下段の行に収める)。
         let prog_h = env_u32("TASKVAR_PROG_H", (content_h / 14).clamp(4, 8)).clamp(2, row2_h);
-        let prog =
-            Rect { x: col3_x, y: row2_y + (row2_h.saturating_sub(prog_h)) / 2, w: col3_w, h: prog_h };
+        let prog = Rect {
+            x: col3_x,
+            y: row2_y + (row2_h.saturating_sub(prog_h)) / 2,
+            // 端のボタンに合わせる(狭くて縮めたときも列③の名目幅とズレない)
+            w: (btn_xs[4] + btn_d[4]).saturating_sub(col3_x),
+            h: prog_h,
+        };
 
         Self {
             panel,
             art,
             col2_x,
             col2_w,
-            col3_x,
-            col3_w,
             row1_y,
             row1_h,
             row2_y,
@@ -215,11 +242,16 @@ impl NpLayout {
         }
     }
 
-    /// 列③を 5 等分した当たり判定スロット(縦はパネル全高)。
-    /// 見た目のボタン(既定 32px)より広く取って指で押しやすくする。
+    /// ボタン i の当たり判定(縦はパネル全高)。左右は隣との中間まで受け持つので、
+    /// 大きさが違っても隙間なく列③を分け合い、見た目より広く押せる。
     fn ctrl_slot(&self, i: usize) -> Rect {
-        let slot_w = self.col3_w / 5;
-        Rect { x: self.col3_x + i as u32 * slot_w, y: self.panel.y, w: slot_w, h: self.panel.h }
+        let half = BTN_GAP / 2;
+        Rect {
+            x: self.btn_xs[i].saturating_sub(half),
+            y: self.panel.y,
+            w: self.btn_d[i] + BTN_GAP,
+            h: self.panel.h,
+        }
     }
 }
 
@@ -270,10 +302,14 @@ impl Bar {
             .iter()
             .enumerate()
             .map(|(i, svg)| {
-                let px = if i == G_PLAY || i == G_PAUSE {
-                    np.btn_d * PLAY_GLYPH_PCT / 100
-                } else {
-                    np.btn_d
+                // グリフはそれが乗るボタンの大きさで焼く(CTRL_SVGS の
+                // 各要素は 1 つのボタンにだけ対応する)。
+                let px = match i {
+                    G_SHUFFLE => np.btn_d[0],
+                    G_PREV => np.btn_d[1],
+                    G_PLAY | G_PAUSE => np.btn_d[2] * PLAY_GLYPH_PCT / 100,
+                    G_NEXT => np.btn_d[3],
+                    _ => np.btn_d[4], // G_REPEAT / G_REPEAT1
                 };
                 icons::render(svg, px.max(1))
             })
@@ -401,7 +437,7 @@ impl Bar {
 
         // 列③ row1: 操作ボタン
         for (i, ctrl) in CTRLS.iter().enumerate() {
-            self.draw_ctrl(buf, *ctrl, l.btn_xs[i], l.btn_y, &view.player);
+            self.draw_ctrl(buf, i, *ctrl, &view.player);
         }
 
         // 列③ row2: 進捗バー
@@ -415,8 +451,8 @@ impl Bar {
     }
 
     /// ボタン 1 個。シャッフル/リピートは ON のとき緑、再生/停止は白円 + 黒グリフ。
-    fn draw_ctrl(&self, buf: &mut [u8], ctrl: Ctrl, x: u32, y: u32, p: &PlayerState) {
-        let d = self.np.btn_d;
+    fn draw_ctrl(&self, buf: &mut [u8], i: usize, ctrl: Ctrl, p: &PlayerState) {
+        let (x, y, d) = (self.np.btn_xs[i], self.np.btn_y[i], self.np.btn_d[i]);
         let (gi, color) = match ctrl {
             Ctrl::Shuffle => (G_SHUFFLE, if p.shuffle { GREEN } else { WHITE }),
             Ctrl::Prev => (G_PREV, WHITE),
@@ -724,15 +760,18 @@ mod tests {
     #[test]
     fn buttons_and_progress_stay_inside_their_rows() {
         let l = NpLayout::new(1366, 96, 24 + 592);
-        assert!(l.btn_d <= l.row1_h, "ボタンが上段からはみ出している");
+        for (i, &d) in l.btn_d.iter().enumerate() {
+            assert!(d <= l.row1_h, "ボタン {i} が上段からはみ出している");
+            assert!(l.btn_y[i] + d <= l.row2_y, "ボタン {i} が進捗バーの行へ食い込んでいる");
+        }
         assert!(l.prog.h <= l.row2_h, "進捗バーが下段からはみ出している");
-        assert!(l.btn_y + l.btn_d <= l.row2_y, "ボタンが進捗バーの行へ食い込んでいる");
         assert!(
             l.prog.y + l.prog.h <= l.panel.y + l.panel.h,
             "進捗バーがパネルの外へ出ている"
         );
-        // 進捗バーはボタン列と同じ幅・同じ左端に揃う
-        assert_eq!((l.prog.x, l.prog.w), (l.col3_x, l.col3_w));
+        // 進捗バーは端のボタンにぴったり揃う
+        assert_eq!(l.prog.x, l.btn_xs[0], "左端がボタン列と合っていない");
+        assert_eq!(l.prog.x + l.prog.w, l.btn_xs[4] + l.btn_d[4], "右端が合っていない");
     }
 
     #[test]
@@ -742,8 +781,8 @@ mod tests {
         assert_eq!(panel_width(2000, 560, Some(300), 72, 200), want);
         // 実際にレイアウトへ通しても列②は 300px
         let l = NpLayout::new(1366, 96, 24 + 592);
-        let text_w = l.col2_w; // 既定(TASKVAR_NP_W=560)の余り
-        assert_eq!(text_w, 560 - PAD * 2 - 72 - GAP - GAP - 200);
+        // 既定(TASKVAR_NP_W=560、ボタン 32px x5 + 間隔 10px x4 = 200)の余り
+        assert_eq!(l.col2_w, 560 - PAD * 2 - 72 - GAP - GAP - 200);
 
         // 使える幅に収まらなければそこで頭打ち
         assert_eq!(panel_width(400, 560, Some(300), 72, 200), 400);
@@ -761,7 +800,10 @@ mod tests {
             assert!(l.panel.x > icons_right, "icons_right={icons_right} で重なっている");
             assert!(l.panel.x + l.panel.w <= 1366, "icons_right={icons_right} で画面外");
             // 列②が潰れても他の列は成立したまま
-            assert_eq!(l.col3_x + l.col3_w + 8, l.panel.x + l.panel.w);
+            // ボタンと進捗バーはパネルの内側に収まる
+            let panel_right = l.panel.x + l.panel.w;
+            assert!(l.btn_xs[4] + l.btn_d[4] + PAD <= panel_right, "ボタンがはみ出している");
+            assert!(l.prog.x + l.prog.w + PAD <= panel_right, "進捗バーがはみ出している");
         }
     }
 }
