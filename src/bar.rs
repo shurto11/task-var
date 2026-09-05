@@ -141,10 +141,14 @@ impl NpLayout {
     fn new(w: u32, h: u32, icons_right: u32) -> Self {
         let panel_h = h.saturating_sub(INSET * 2);
         let content_h = panel_h - PAD * 2;
+        // 行の分割は content_h だけで決まる(上段=曲名/ボタン、下段=アーティスト/進捗バー)。
+        let row1_h = content_h / 2 + 2;
+        let row2_h = content_h - row1_h;
 
         // 列①のアルバムアートは行をぶち抜く正方形、列③はボタン 5 個ぶん。
         // この 2 つは先に決まるので、パネル幅はそこから逆算できる。
-        let want_btn = env_u32("TASKVAR_BTN_D", 32);
+        // ボタンは自分の行に収まる大きさまで(2x3 グリッドの升目をはみ出さない)。
+        let want_btn = env_u32("TASKVAR_BTN_D", 32).min(row1_h);
         let want_col3 = want_btn * 5 + BTN_GAP * 4;
         let avail = w.saturating_sub(MARGIN).saturating_sub(icons_right + GAP);
         let panel_w = panel_width(
@@ -171,9 +175,6 @@ impl NpLayout {
         let col2_w = rest.saturating_sub(GAP + col3_w);
         let col2_x = art.x + art.w + GAP;
         let col3_x = col2_x + col2_w + GAP;
-
-        let row1_h = content_h / 2 + 2;
-        let row2_h = content_h - row1_h;
         let (row1_y, row2_y) = (content_y, content_y + row1_h);
 
         let btn_y = row1_y + (row1_h.saturating_sub(btn_d)) / 2;
@@ -182,7 +183,9 @@ impl NpLayout {
             *x = col3_x + i as u32 * (btn_d + BTN_GAP);
         }
 
-        let prog_h = (content_h / 14).clamp(4, 8);
+        // 進捗バーはボタン列と同じ幅で、下段の行の中央に置く。
+        // 高さは env `TASKVAR_PROG_H` で調整できる(こちらも下段の行に収める)。
+        let prog_h = env_u32("TASKVAR_PROG_H", (content_h / 14).clamp(4, 8)).clamp(2, row2_h);
         let prog =
             Rect { x: col3_x, y: row2_y + (row2_h.saturating_sub(prog_h)) / 2, w: col3_w, h: prog_h };
 
@@ -716,6 +719,20 @@ mod tests {
         }
         std::env::remove_var(K);
         assert_eq!(env_f32(K, 7.0), 7.0);
+    }
+
+    #[test]
+    fn buttons_and_progress_stay_inside_their_rows() {
+        let l = NpLayout::new(1366, 96, 24 + 592);
+        assert!(l.btn_d <= l.row1_h, "ボタンが上段からはみ出している");
+        assert!(l.prog.h <= l.row2_h, "進捗バーが下段からはみ出している");
+        assert!(l.btn_y + l.btn_d <= l.row2_y, "ボタンが進捗バーの行へ食い込んでいる");
+        assert!(
+            l.prog.y + l.prog.h <= l.panel.y + l.panel.h,
+            "進捗バーがパネルの外へ出ている"
+        );
+        // 進捗バーはボタン列と同じ幅・同じ左端に揃う
+        assert_eq!((l.prog.x, l.prog.w), (l.col3_x, l.col3_w));
     }
 
     #[test]
