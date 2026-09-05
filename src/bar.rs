@@ -174,12 +174,13 @@ impl NpLayout {
             btn_xs,
             btn_y,
             prog,
-            // 既定はパネル高から算出する。好みで詰めたいときは
-            // TASKVAR_TITLE_PX / TASKVAR_ARTIST_PX で上書きできる
-            // (行に収まる範囲へ丸めるので、曲名とアーティストは重ならない)。
-            title_px: env_f32("TASKVAR_TITLE_PX", (content_h as f32 * 0.25).clamp(11.0, 24.0))
+            // 既定はパネル高に比例させる。係数は 1366x768(バー高 96px →
+            // content_h 72px)でちょうど曲名 30px・アーティスト 22px になる値。
+            // 一時的に変えたいときは TASKVAR_TITLE_PX / TASKVAR_ARTIST_PX で
+            // 上書きできる(行に収まる範囲へ丸めるので両行は重ならない)。
+            title_px: env_f32("TASKVAR_TITLE_PX", (content_h as f32 * 0.4167).clamp(12.0, 30.0))
                 .clamp(6.0, row1_h as f32),
-            artist_px: env_f32("TASKVAR_ARTIST_PX", (content_h as f32 * 0.21).clamp(10.0, 20.0))
+            artist_px: env_f32("TASKVAR_ARTIST_PX", (content_h as f32 * 0.3056).clamp(10.0, 22.0))
                 .clamp(6.0, row2_h as f32),
         }
     }
