@@ -79,6 +79,11 @@ fn env_opt_u32(name: &str) -> Option<u32> {
     std::env::var(name).ok().and_then(|v| v.trim().parse().ok()).filter(|v| *v > 0)
 }
 
+/// 上下のずらし量。負値も取れる。
+fn env_i32(name: &str, default: i32) -> i32 {
+    std::env::var(name).ok().and_then(|v| v.trim().parse().ok()).unwrap_or(default)
+}
+
 /// 文字サイズ用。0 以下や解析できない値は既定へ落とす。
 fn env_f32(name: &str, default: f32) -> f32 {
     std::env::var(name)
@@ -131,6 +136,8 @@ const INSET: u32 = 4; // バー上下からの余白
 const PAD: u32 = 8; // パネル内側の余白
 const GAP: u32 = 12; // 列間
 const BTN_GAP: u32 = 10;
+/// ボタン列と進捗バーの間隔。
+const CTRL_GAP: u32 = 16;
 
 /// パネルの幅を決める。
 ///
@@ -158,9 +165,13 @@ impl NpLayout {
         // 列①のアルバムアートは行をぶち抜く正方形、列③はボタン 5 個ぶん。
         // この 2 つは先に決まるので、パネル幅はそこから逆算できる。
         // ボタンは自分の行に収まる大きさまで(2x3 グリッドの升目をはみ出さない)。
+        // 進捗バーの高さは先に決める。ボタンの上限がこれに依存するため。
+        let prog_h = env_u32("TASKVAR_PROG_H", (content_h / 14).clamp(4, 8)).clamp(2, content_h / 2);
+        // ボタンは「進捗バーと合わせてパネルの高さに収まる」ところまで。
+        let btn_cap = panel_h.saturating_sub(CTRL_GAP + prog_h);
         let base = env_u32("TASKVAR_BTN_D", 32);
         let want: [u32; 5] =
-            std::array::from_fn(|i| env_opt_u32(BTN_ENV[i]).unwrap_or(base).min(row1_h));
+            std::array::from_fn(|i| env_opt_u32(BTN_ENV[i]).unwrap_or(base).min(btn_cap));
         let want_col3 = want.iter().sum::<u32>() + BTN_GAP * 4;
         let avail = w.saturating_sub(MARGIN).saturating_sub(icons_right + GAP);
         let panel_w = panel_width(
@@ -196,7 +207,16 @@ impl NpLayout {
         let col3_x = col2_x + col2_w + GAP;
         let (row1_y, row2_y) = (content_y, content_y + row1_h);
 
-        let btn_y = btn_d.map(|d| row1_y + (row1_h.saturating_sub(d)) / 2);
+        // 列③(ボタン + 進捗バー)はテキストの行に合わせず、ひとまとまりとして
+        // パネルの縦中央に置く。行に揃えると上へ寄って見えるため。
+        // `TASKVAR_CTRL_DY` で上下に微調整できる(パネルからは出ない)。
+        let btn_max = btn_d.iter().copied().max().unwrap_or(0);
+        let group_h = btn_max + CTRL_GAP + prog_h;
+        let centered = panel.y + panel_h.saturating_sub(group_h) / 2;
+        let lowest = (panel.y + panel_h).saturating_sub(group_h);
+        let group_y = (centered as i64 + env_i32("TASKVAR_CTRL_DY", 0) as i64)
+            .clamp(panel.y as i64, lowest as i64) as u32;
+        let btn_y = btn_d.map(|d| group_y + (btn_max - d) / 2);
         // 並べる位置。列③に入りきらないほど狭いときは右端で止めて、
         // ボタンがパネルの外へ出ないようにする。
         let col3_right = col3_x + col3_w;
@@ -207,12 +227,10 @@ impl NpLayout {
             x += btn_d[i] + BTN_GAP;
         }
 
-        // 進捗バーはボタン列と同じ幅で、下段の行の中央に置く。
-        // 高さは env `TASKVAR_PROG_H` で調整できる(こちらも下段の行に収める)。
-        let prog_h = env_u32("TASKVAR_PROG_H", (content_h / 14).clamp(4, 8)).clamp(2, row2_h);
+        // 進捗バーはボタン列の直下、同じ幅で。
         let prog = Rect {
             x: col3_x,
-            y: row2_y + (row2_h.saturating_sub(prog_h)) / 2,
+            y: group_y + btn_max + CTRL_GAP,
             // 端のボタンに合わせる(狭くて縮めたときも列③の名目幅とズレない)
             w: (btn_xs[4] + btn_d[4]).saturating_sub(col3_x),
             h: prog_h,
@@ -758,16 +776,22 @@ mod tests {
     }
 
     #[test]
-    fn buttons_and_progress_stay_inside_their_rows() {
+    fn controls_sit_centred_and_inside_the_panel() {
         let l = NpLayout::new(1366, 96, 24 + 592);
+        let (top, bottom) = (l.panel.y, l.panel.y + l.panel.h);
         for (i, &d) in l.btn_d.iter().enumerate() {
-            assert!(d <= l.row1_h, "ボタン {i} が上段からはみ出している");
-            assert!(l.btn_y[i] + d <= l.row2_y, "ボタン {i} が進捗バーの行へ食い込んでいる");
+            assert!(l.btn_y[i] >= top, "ボタン {i} がパネルの上へ出ている");
+            assert!(l.btn_y[i] + d <= l.prog.y, "ボタン {i} が進捗バーへ食い込んでいる");
         }
-        assert!(l.prog.h <= l.row2_h, "進捗バーが下段からはみ出している");
+        assert!(l.prog.y + l.prog.h <= bottom, "進捗バーがパネルの外へ出ている");
+
+        // ボタンと進捗バーはひとまとまりでパネルの縦中央に来る(誤差は丸めぶんのみ)
+        let group_top = *l.btn_y.iter().min().unwrap();
+        let slack_above = group_top - top;
+        let slack_below = bottom - (l.prog.y + l.prog.h);
         assert!(
-            l.prog.y + l.prog.h <= l.panel.y + l.panel.h,
-            "進捗バーがパネルの外へ出ている"
+            slack_above.abs_diff(slack_below) <= 1,
+            "上下の余白が揃っていない: 上 {slack_above} / 下 {slack_below}"
         );
         // 進捗バーは端のボタンにぴったり揃う
         assert_eq!(l.prog.x, l.btn_xs[0], "左端がボタン列と合っていない");
