@@ -626,13 +626,26 @@ mod tests {
             assert_eq!(bar.hit(sx, sy, false), None, "非表示時のスロット {i}");
         }
 
-        // TASKVAR_TEST_DUMP=path で目視確認用の PPM を書き出す
+        // TASKVAR_TEST_DUMP=path で目視確認用の PPM を書き出す。
+        // トグルの ON/OFF でグリフと色が変わるので、両方の状態を出す
+        // (path と path.off の 2 枚)。
         if let Ok(path) = std::env::var("TASKVAR_TEST_DUMP") {
-            let mut ppm = format!("P6\n{w} {h}\n255\n").into_bytes();
-            for p in buf.chunks_exact(4) {
-                ppm.extend_from_slice(&[p[2], p[1], p[0]]); // BGRA → RGB
-            }
-            std::fs::write(path, ppm).unwrap();
+            let dump = |buf: &[u8], to: &str| {
+                let mut ppm = format!("P6\n{w} {h}\n255\n").into_bytes();
+                for p in buf.chunks_exact(4) {
+                    ppm.extend_from_slice(&[p[2], p[1], p[0]]); // BGRA → RGB
+                }
+                std::fs::write(to, ppm).unwrap();
+            };
+            dump(&buf, &path);
+            // シャッフル OFF / 1 曲リピート / 停止中
+            let off = NpView {
+                np: &np,
+                player: PlayerState { playing: false, shuffle: false, repeat: Loop::Track },
+                art: None,
+            };
+            bar.draw(&mut buf, &st, Some(&off));
+            dump(&buf, &format!("{path}.off"));
         }
     }
 
