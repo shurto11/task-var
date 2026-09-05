@@ -75,6 +75,67 @@ pub struct Snapshot {
     pub np: Option<NowPlaying>,
 }
 
+impl PlayerState {
+    /// ボタンを押した直後に期待される状態。
+    pub fn after(self, ctrl: Ctrl) -> Self {
+        match ctrl {
+            Ctrl::Shuffle => Self { shuffle: !self.shuffle, ..self },
+            Ctrl::Repeat => Self { repeat: self.repeat.cycle(), ..self },
+            Ctrl::PlayPause => Self { playing: !self.playing, ..self },
+            Ctrl::Prev | Ctrl::Next => self,
+        }
+    }
+
+    /// `ctrl` が対象とするフィールドだけを `want` の値で上書きする。
+    fn overlay(&mut self, ctrl: Ctrl, want: &Self) {
+        match ctrl {
+            Ctrl::Shuffle => self.shuffle = want.shuffle,
+            Ctrl::Repeat => self.repeat = want.repeat,
+            Ctrl::PlayPause => self.playing = want.playing,
+            Ctrl::Prev | Ctrl::Next => {}
+        }
+    }
+
+    /// `ctrl` の操作が反映されたか(対象フィールドだけを見る)。
+    fn reflects(&self, ctrl: Ctrl, want: &Self) -> bool {
+        match ctrl {
+            Ctrl::Shuffle => self.shuffle == want.shuffle,
+            Ctrl::Repeat => self.repeat == want.repeat,
+            Ctrl::PlayPause => self.playing == want.playing,
+            // 曲送りは状態で確認できないので即座に確定扱い
+            Ctrl::Prev | Ctrl::Next => true,
+        }
+    }
+}
+
+/// ボタンを押してからポーリングが追いつくまでの間、押した結果を表示に反映して
+/// おくための保留値。spotatui 側の反映が遅いときに一瞬元へ戻って見えるのを防ぐ。
+/// 期限切れまでに反映されなければ諦めて実際の値へ戻す(= 効いていないことが分かる)。
+pub struct Pending {
+    ctrl: Ctrl,
+    want: PlayerState,
+    until: std::time::Instant,
+}
+
+/// 保留を持てる時間。
+const HOLD: Duration = Duration::from_secs(5);
+
+impl Pending {
+    pub fn new(ctrl: Ctrl, want: PlayerState) -> Self {
+        Self { ctrl, want, until: std::time::Instant::now() + HOLD }
+    }
+
+    /// ポーリング結果 `got` に保留値をかぶせる。反映済み/期限切れなら false を
+    /// 返す(呼び出し側が保留を捨てる)。
+    pub fn overlay(&self, got: &mut PlayerState, now: std::time::Instant) -> bool {
+        if got.reflects(self.ctrl, &self.want) || now >= self.until {
+            return false;
+        }
+        got.overlay(self.ctrl, &self.want);
+        true
+    }
+}
+
 /// パネル上の操作ボタン。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Ctrl {
@@ -186,7 +247,12 @@ pub fn activate(ctrl: Ctrl, cur: PlayerState) {
         match ctrl {
             Ctrl::Prev => cmd.args(["call", DEST, OBJ, IFACE, "Previous"]),
             Ctrl::Next => cmd.args(["call", DEST, OBJ, IFACE, "Next"]),
-            Ctrl::PlayPause => cmd.args(["call", DEST, OBJ, IFACE, "PlayPause"]),
+            // spotatui の PlayPause は自前の再生フラグで分岐する。そのフラグが
+            // 実際の再生とずれていると逆の操作(=停止のつもりが曲送り)になるため、
+            // こちらの判定で Pause / Play を明示して送る。
+            Ctrl::PlayPause => {
+                cmd.args(["call", DEST, OBJ, IFACE, if cur.playing { "Pause" } else { "Play" }])
+            }
             Ctrl::Shuffle => cmd.args([
                 "set-property",
                 DEST,
@@ -210,12 +276,42 @@ pub fn activate(ctrl: Ctrl, cur: PlayerState) {
     });
 }
 
+/// ポーリング間隔。
+const POLL_EVERY: Duration = Duration::from_secs(1);
+/// Position がこれ以上進んでいれば再生中とみなす(ポーリング間隔に対する余裕)。
+const POS_EPSILON_MS: u64 = 200;
+
+/// PlaybackStatus を Position の進み具合で上書き判定する。
+/// spotatui の PlaybackStatus は、librespot が非アクティブなデバイスを掴んで
+/// いると実際の再生と食い違う(実機で Position は進むのに Stopped のままになる
+/// のを確認した)。曲が変わった直後など比較できないときは None。
+fn playing_by_position(prev: &Option<(String, u64)>, np: &NowPlaying) -> Option<bool> {
+    let (track, pos) = prev.as_ref()?;
+    (*track == np.track).then(|| np.progress_ms > pos + POS_EPSILON_MS)
+}
+
 /// 1 秒間隔で状態をポーリングするスレッドを起動する(detached)。
 pub fn spawn(shared: Arc<Mutex<Option<Snapshot>>>) {
-    std::thread::spawn(move || loop {
-        let s = poll();
-        *shared.lock().unwrap() = s;
-        std::thread::sleep(Duration::from_secs(1));
+    std::thread::spawn(move || {
+        let mut prev: Option<(String, u64)> = None;
+        loop {
+            let mut snap = poll();
+            prev = match snap.as_mut() {
+                Some(s) => match s.np.as_mut() {
+                    Some(np) => {
+                        if let Some(playing) = playing_by_position(&prev, np) {
+                            s.player.playing = playing;
+                            np.is_playing = playing; // 進捗の補間もこれに従う
+                        }
+                        Some((np.track.clone(), np.progress_ms))
+                    }
+                    None => None,
+                },
+                None => None,
+            };
+            *shared.lock().unwrap() = snap;
+            std::thread::sleep(POLL_EVERY);
+        }
     });
 }
 
@@ -252,6 +348,62 @@ mod tests {
         assert_eq!(data(r#"{"type":"s","data":"Playing"}"#), Some(Value::from("Playing")));
         assert_eq!(data(r#"{"type":"b","data":true}"#), Some(Value::from(true)));
         assert_eq!(data("not json"), None);
+    }
+
+    fn st(playing: bool, shuffle: bool, repeat: Loop) -> PlayerState {
+        PlayerState { playing, shuffle, repeat }
+    }
+
+    #[test]
+    fn playing_follows_the_position_not_the_status() {
+        let mut np = NowPlaying {
+            track: "HOP".into(),
+            artist: "a".into(),
+            art_url: None,
+            progress_ms: 5_000,
+            duration_ms: 100_000,
+            written_at_ms: 0,
+            is_playing: false,
+        };
+        // 同じ曲で Position が進んでいれば再生中
+        let prev = Some(("HOP".to_string(), 4_000u64));
+        assert_eq!(playing_by_position(&prev, &np), Some(true));
+        // 止まっていれば停止中(PlaybackStatus が Playing でもこちらを採る)
+        np.progress_ms = 4_100; // 誤差の範囲
+        assert_eq!(playing_by_position(&prev, &np), Some(false));
+        // 曲が変わった直後と初回は判定できない
+        np.track = "LOCO".into();
+        assert_eq!(playing_by_position(&prev, &np), None);
+        assert_eq!(playing_by_position(&None, &np), None);
+    }
+
+    #[test]
+    fn pending_holds_until_reflected_or_expired() {
+        let now = std::time::Instant::now();
+        let cur = st(true, false, Loop::Off);
+        let want = cur.after(Ctrl::Shuffle);
+        assert!(want.shuffle, "シャッフルはトグルされる");
+        let p = Pending::new(Ctrl::Shuffle, want);
+
+        // まだ反映されていない間は保留値をかぶせる
+        let mut got = cur;
+        assert!(p.overlay(&mut got, now));
+        assert!(got.shuffle, "押した直後は ON に見える");
+
+        // 反映されたら保留を捨てる
+        let mut got = st(true, true, Loop::Off);
+        assert!(!p.overlay(&mut got, now));
+
+        // 期限切れでも捨てる(効いていないことが表示に出る)
+        let mut got = cur;
+        assert!(!p.overlay(&mut got, now + HOLD + Duration::from_secs(1)));
+
+        // 対象外のフィールドは触らない
+        let p = Pending::new(Ctrl::Repeat, cur.after(Ctrl::Repeat));
+        let mut got = st(false, true, Loop::Off);
+        assert!(p.overlay(&mut got, now));
+        assert_eq!(got.repeat, Loop::Playlist);
+        assert!(!got.playing && got.shuffle, "repeat 以外は実際の値のまま");
     }
 
     #[test]

@@ -32,7 +32,7 @@ mod touch_client;
 
 use anyhow::Result;
 use bar::{Bar, Hit, NpView};
-use mpris::{PlayerState, Snapshot};
+use mpris::{Pending, PlayerState, Snapshot};
 use np::NowPlaying;
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
@@ -75,6 +75,8 @@ struct Np {
     player: Option<PlayerState>,
     /// 取得済みのアルバムアート(URL と BGRA)。
     art: Option<(String, Vec<u8>)>,
+    /// ボタンを押した直後の期待値。ポーリングが追いつくまで表示に反映する。
+    pending: Option<Pending>,
 }
 
 impl Np {
@@ -85,7 +87,14 @@ impl Np {
     /// だと JSON を更新しないため、実機ではこちらが本命になる)。
     fn refresh(&mut self, art: &art::Art, shared: &Arc<Mutex<Option<Snapshot>>>) {
         let snap = shared.lock().unwrap().clone();
-        self.player = snap.as_ref().map(|s| s.player);
+        let mut player = snap.as_ref().map(|s| s.player);
+        // 押した直後のボタンは、MPRIS 側が追いつくまで手元の期待値を見せる。
+        if let (Some(p), Some(got)) = (&self.pending, player.as_mut()) {
+            if !p.overlay(got, Instant::now()) {
+                self.pending = None;
+            }
+        }
+        self.player = player;
         self.now = np::read()
             .filter(NowPlaying::is_fresh)
             .or_else(|| snap.and_then(|s| s.np));
@@ -352,26 +361,12 @@ fn main() -> Result<()> {
                         if let Some(p) = np.player {
                             eprintln!("task-var: {c:?} を MPRIS へ送信");
                             mpris::activate(c, p);
-                            // 手元の状態を先に進めて即座に描き直す
-                            // (1 秒後のポーリングで実際の値に補正される)
-                            let next = PlayerState {
-                                playing: match c {
-                                    mpris::Ctrl::PlayPause => !p.playing,
-                                    _ => p.playing,
-                                },
-                                shuffle: match c {
-                                    mpris::Ctrl::Shuffle => !p.shuffle,
-                                    _ => p.shuffle,
-                                },
-                                repeat: match c {
-                                    mpris::Ctrl::Repeat => p.repeat.cycle(),
-                                    _ => p.repeat,
-                                },
-                            };
+                            // 手元の状態を先に進めて即座に描き直す。実際の値は
+                            // ポーリングで確認し、反映されるまで(最長 5 秒)
+                            // この期待値を見せ続ける。
+                            let next = p.after(c);
                             np.player = Some(next);
-                            if let Some(s) = player_shared.lock().unwrap().as_mut() {
-                                s.player = next;
-                            }
+                            np.pending = Some(Pending::new(c, next));
                         }
                     }
                     None => {}
