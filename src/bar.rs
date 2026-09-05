@@ -57,8 +57,13 @@ const CTRL_SVGS: [&[u8]; 7] = [
 pub const CTRLS: [Ctrl; 5] =
     [Ctrl::Shuffle, Ctrl::Prev, Ctrl::PlayPause, Ctrl::Next, Ctrl::Repeat];
 
+/// ボタンごとの既定の大きさ。並びは `CTRLS` と揃える。
+/// 再生/停止を大きく、曲送りを小さく、トグルはその中間にしてある。
+const BTN_D_DEFAULT: [u32; 5] = [20, 16, 35, 16, 20];
+
 /// ボタンごとの大きさを指定する env var。並びは `CTRLS` と揃える。
-/// 未指定のものは `TASKVAR_BTN_D`(全体の既定)へ落ちる。
+/// 未指定のものは `TASKVAR_BTN_D`(5 つ共通の上書き)、それも無ければ
+/// `BTN_D_DEFAULT` へ落ちる。
 const BTN_ENV: [&str; 5] = [
     "TASKVAR_BTN_D_SHUFFLE",
     "TASKVAR_BTN_D_PREV",
@@ -166,17 +171,19 @@ impl NpLayout {
         // この 2 つは先に決まるので、パネル幅はそこから逆算できる。
         // ボタンは自分の行に収まる大きさまで(2x3 グリッドの升目をはみ出さない)。
         // 進捗バーの高さは先に決める。ボタンの上限がこれに依存するため。
-        let prog_h = env_u32("TASKVAR_PROG_H", (content_h / 14).clamp(4, 8)).clamp(2, content_h / 2);
+        let prog_h = env_u32("TASKVAR_PROG_H", (content_h / 18).clamp(3, 8)).clamp(2, content_h / 2);
         // ボタンは「進捗バーと合わせてパネルの高さに収まる」ところまで。
         let btn_cap = panel_h.saturating_sub(CTRL_GAP + prog_h);
-        let base = env_u32("TASKVAR_BTN_D", 32);
-        let want: [u32; 5] =
-            std::array::from_fn(|i| env_opt_u32(BTN_ENV[i]).unwrap_or(base).min(btn_cap));
+        // 個別指定 > 5 つ共通の TASKVAR_BTN_D > ボタンごとの既定
+        let base = env_opt_u32("TASKVAR_BTN_D");
+        let want: [u32; 5] = std::array::from_fn(|i| {
+            env_opt_u32(BTN_ENV[i]).or(base).unwrap_or(BTN_D_DEFAULT[i]).min(btn_cap)
+        });
         let want_col3 = want.iter().sum::<u32>() + BTN_GAP * 4;
         let avail = w.saturating_sub(MARGIN).saturating_sub(icons_right + GAP);
         let panel_w = panel_width(
             avail,
-            env_u32("TASKVAR_NP_W", 560),
+            env_u32("TASKVAR_NP_W", 400),
             env_opt_u32("TASKVAR_TEXT_W"),
             content_h,
             want_col3,
@@ -250,10 +257,10 @@ impl NpLayout {
             btn_y,
             prog,
             // 既定はパネル高に比例させる。係数は 1366x768(バー高 96px →
-            // content_h 72px)でちょうど曲名 30px・アーティスト 22px になる値。
+            // content_h 72px)でちょうど曲名 28px・アーティスト 22px になる値。
             // 一時的に変えたいときは TASKVAR_TITLE_PX / TASKVAR_ARTIST_PX で
             // 上書きできる(行に収まる範囲へ丸めるので両行は重ならない)。
-            title_px: env_f32("TASKVAR_TITLE_PX", (content_h as f32 * 0.4167).clamp(12.0, 30.0))
+            title_px: env_f32("TASKVAR_TITLE_PX", (content_h as f32 * 0.3889).clamp(12.0, 28.0))
                 .clamp(6.0, row1_h as f32),
             artist_px: env_f32("TASKVAR_ARTIST_PX", (content_h as f32 * 0.3056).clamp(10.0, 22.0))
                 .clamp(6.0, row2_h as f32),
@@ -805,8 +812,9 @@ mod tests {
         assert_eq!(panel_width(2000, 560, Some(300), 72, 200), want);
         // 実際にレイアウトへ通しても列②は 300px
         let l = NpLayout::new(1366, 96, 24 + 592);
-        // 既定(TASKVAR_NP_W=560、ボタン 32px x5 + 間隔 10px x4 = 200)の余り
-        assert_eq!(l.col2_w, 560 - PAD * 2 - 72 - GAP - GAP - 200);
+        // 既定では列②はパネル幅の余り(定数から算出するので既定値を変えても追従する)
+        let col3 = BTN_D_DEFAULT.iter().sum::<u32>() + BTN_GAP * 4;
+        assert_eq!(l.col2_w, 400 - PAD * 2 - 72 - GAP - GAP - col3);
 
         // 使える幅に収まらなければそこで頭打ち
         assert_eq!(panel_width(400, 560, Some(300), 72, 200), 400);
