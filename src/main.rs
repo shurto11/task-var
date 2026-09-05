@@ -1,6 +1,10 @@
 //! task-var: フレームバッファ画面下部にセッション切替タスクバーを表示する。
 //!
-//! - 下中央に白円アイコン(tmux / Spotify / YouTube Shorts / Bluetooth / ssbrowse)を表示
+//! - 左側に白円アイコン(tmux / Spotify / YouTube Shorts / Bluetooth / ssbrowse /
+//!   eduroam / カレンダー)を横一列に表示
+//! - 右側に Spotify の再生情報パネル(アルバムアート・曲名・アーティスト・
+//!   操作ボタン 5 個・進捗バー)を表示する。表示データは spotatui が書く
+//!   `/tmp/spotatui_np.json`、操作とシャッフル/リピート状態は MPRIS。
 //! - タッチ入力は touch-server から受け取る(バー矩形を region として申告)
 //! - アイコンタップで対応 tmux セッションへ遷移(なければ作成してプログラム実行)
 //! - 通常は端末行数を縮めてバー領域を専有し、終了時に復元する(touch-key と同方式)
@@ -14,15 +18,22 @@
 //!   (tmux-session スイッチャー実行中は SIGSTOP で止められる想定)
 
 mod actions;
+mod art;
 mod bar;
 mod fb;
 mod fb_client;
 mod icons;
+mod mpris;
+mod np;
 mod term;
+mod text;
 mod tmux;
 mod touch_client;
 
 use anyhow::Result;
+use bar::{Bar, Hit, NpView};
+use mpris::{PlayerState, Snapshot};
+use np::NowPlaying;
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -50,8 +61,78 @@ const SWIPE_ZONE_FRAC: f64 = 0.06;
 /// (fbhalf 等)より上に描くので、重なった領域のタッチはこちらが受け取る。
 const TOUCH_PRIORITY: i32 = 10;
 
+/// 全面ブリットの最短間隔。この間は進捗バーのためにパネル部分だけを部分ブリットする。
+const FULL_BLIT_EVERY: Duration = Duration::from_secs(1);
+
 fn env_u32(name: &str, default: u32) -> u32 {
     std::env::var(name).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
+}
+
+/// 再生情報まわりの現在値。main のループが保持する。
+#[derive(Default)]
+struct Np {
+    now: Option<NowPlaying>,
+    player: Option<PlayerState>,
+    /// 取得済みのアルバムアート(URL と BGRA)。
+    art: Option<(String, Vec<u8>)>,
+}
+
+impl Np {
+    /// JSON・MPRIS・アート取得スレッドの結果を取り込む。
+    ///
+    /// 曲情報は spotatui が書く JSON を第一候補にし、それが無い/古いときは
+    /// MPRIS の Metadata から組み立てたものを使う(spotatui はネイティブ再生中
+    /// だと JSON を更新しないため、実機ではこちらが本命になる)。
+    fn refresh(&mut self, art: &art::Art, shared: &Arc<Mutex<Option<Snapshot>>>) {
+        let snap = shared.lock().unwrap().clone();
+        self.player = snap.as_ref().map(|s| s.player);
+        self.now = np::read()
+            .filter(NowPlaying::is_fresh)
+            .or_else(|| snap.and_then(|s| s.np));
+        if let Some(url) = self.now.as_ref().and_then(|n| n.art_url.as_deref()) {
+            art.request(url);
+        }
+        if let Some(got) = art.take() {
+            self.art = Some(got);
+        }
+    }
+
+    /// パネルに描く内容。MPRIS が応答しない(= spotatui が居ない)なら None を
+    /// 返してパネルごと消す。JSON は古いまま残りうるので、生存確認は MPRIS 側で行う。
+    fn view(&self) -> Option<NpView<'_>> {
+        let now = self.now.as_ref()?;
+        let player = self.player?;
+        // アートは今の曲のものだけ使う(曲送り直後の取り違えを防ぐ)
+        let art = self
+            .art
+            .as_ref()
+            .filter(|(url, _)| Some(url.as_str()) == now.art_url.as_deref())
+            .map(|(_, bgra)| bgra.as_slice());
+        Some(NpView { np: now, player, art })
+    }
+
+    /// 再生中かどうか(短周期で回して進捗バーを動かすかの判断に使う)。
+    fn is_playing(&self) -> bool {
+        self.player.is_some_and(|p| p.playing)
+    }
+}
+
+/// バー全体を描き直し、パネルを描いたかどうかを返す。
+fn redraw(bar: &Bar, buf: &mut [u8], state: &tmux::State, np: &Np) -> bool {
+    let view = np.view();
+    bar.draw(buf, state, view.as_ref());
+    view.is_some()
+}
+
+/// バーバッファから矩形 `r` を切り出して連続バイト列にする(部分ブリット用)。
+fn sub_rect(buf: &[u8], buf_w: u32, r: bar::Rect) -> Vec<u8> {
+    let row = (r.w * 4) as usize;
+    let mut out = Vec::with_capacity(row * r.h as usize);
+    for j in 0..r.h {
+        let off = (((r.y + j) * buf_w + r.x) * 4) as usize;
+        out.extend_from_slice(&buf[off..off + row]);
+    }
+    out
 }
 
 fn main() -> Result<()> {
@@ -86,10 +167,17 @@ fn main() -> Result<()> {
         });
     }
 
-    let bar = bar::Bar::new(screen_w, bar_h)?;
+    let bar = Bar::new(screen_w, bar_h)?;
     let mut buf = vec![0u8; (screen_w * bar_h * 4) as usize];
     let mut state = tmux::State::poll();
-    bar.draw(&mut buf, &state);
+
+    // 再生情報: MPRIS のポーリングスレッドとアルバムアートの取得スレッド。
+    let player_shared: Arc<Mutex<Option<Snapshot>>> = Arc::new(Mutex::new(None));
+    mpris::spawn(player_shared.clone());
+    let art = art::Art::spawn(bar.art_side());
+    let mut np = Np::default();
+    np.refresh(&art, &player_shared);
+    let mut np_shown = redraw(&bar, &mut buf, &state, &np);
 
     // touch-server クライアント起動。バー表示中は帯全体、非表示中は下端だけを
     // region として申告する(残りは fbhalf 等が受け取れる)。優先度を付けて、
@@ -134,6 +222,7 @@ fn main() -> Result<()> {
     let mut bar_shown = true; // バーを実際に描画しているか
     let mut hide_at: Option<Instant> = None; // スワイプ表示の自動非表示期限
     let mut last_poll = Instant::now();
+    let mut last_full = Instant::now();
     // 初期状態を描画(通常モードで可視)
     fb.blit(0, bar_y, screen_w, bar_h, &buf)?;
 
@@ -191,6 +280,7 @@ fn main() -> Result<()> {
                     if visible && !bar_shown {
                         show_bar(&fb, &buf)?;
                         bar_shown = true;
+                        last_full = Instant::now();
                     }
                 }
             }
@@ -202,6 +292,7 @@ fn main() -> Result<()> {
                 } else if !visible && msg.visible && !bar_shown {
                     show_bar(&fb, &buf)?;
                     bar_shown = true;
+                    last_full = Instant::now();
                 }
                 visible = msg.visible;
             } else {
@@ -210,8 +301,11 @@ fn main() -> Result<()> {
         }
 
         // 表示中は自動非表示のチェックと再ブリットのため短周期で回す。
+        // 再生中はさらに短くして進捗バーを滑らかに進める。
         let timeout = if bar_shown && swipe_mode {
             Duration::from_millis(200)
+        } else if bar_shown && np_shown && np.is_playing() {
+            Duration::from_millis(500)
         } else {
             Duration::from_secs(1)
         };
@@ -227,9 +321,11 @@ fn main() -> Result<()> {
                     let swiped_up = -dy > SWIPE_UP_FRAC && (-dy) > dx.abs();
                     if swiped_up {
                         state = tmux::State::poll();
-                        bar.draw(&mut buf, &state);
+                        np.refresh(&art, &player_shared);
+                        np_shown = redraw(&bar, &mut buf, &state, &np);
                         show_bar(&fb, &buf)?;
                         bar_shown = true;
+                        last_full = Instant::now();
                         hide_at = Some(Instant::now() + HIDE_AFTER);
                     }
                     continue;
@@ -246,16 +342,46 @@ fn main() -> Result<()> {
                 }
                 let lx = up.fx1 * screen_w as f64;
                 let ly = up.fy1 * screen_h as f64 - bar_y as f64;
-                if let Some(i) = bar.hit(lx, ly) {
-                    if let Err(e) = actions::activate(&actions::ICONS[i], &state, bar_h) {
-                        eprintln!("task-var: {} の起動に失敗: {e:#}", actions::ICONS[i].name);
+                match bar.hit(lx, ly, np_shown) {
+                    Some(Hit::Icon(i)) => {
+                        if let Err(e) = actions::activate(&actions::ICONS[i], &state) {
+                            eprintln!("task-var: {} の起動に失敗: {e:#}", actions::ICONS[i].name);
+                        }
                     }
+                    Some(Hit::Ctrl(c)) => {
+                        if let Some(p) = np.player {
+                            eprintln!("task-var: {c:?} を MPRIS へ送信");
+                            mpris::activate(c, p);
+                            // 手元の状態を先に進めて即座に描き直す
+                            // (1 秒後のポーリングで実際の値に補正される)
+                            let next = PlayerState {
+                                playing: match c {
+                                    mpris::Ctrl::PlayPause => !p.playing,
+                                    _ => p.playing,
+                                },
+                                shuffle: match c {
+                                    mpris::Ctrl::Shuffle => !p.shuffle,
+                                    _ => p.shuffle,
+                                },
+                                repeat: match c {
+                                    mpris::Ctrl::Repeat => p.repeat.cycle(),
+                                    _ => p.repeat,
+                                },
+                            };
+                            np.player = Some(next);
+                            if let Some(s) = player_shared.lock().unwrap().as_mut() {
+                                s.player = next;
+                            }
+                        }
+                    }
+                    None => {}
                 }
                 // タップ直後は状態が変わっているはずなので即時更新
                 state = tmux::State::poll();
-                bar.draw(&mut buf, &state);
+                np_shown = redraw(&bar, &mut buf, &state, &np);
                 if bar_shown {
                     fb.blit(0, bar_y, screen_w, bar_h, &buf)?;
+                    last_full = Instant::now();
                 }
             }
             Err(mpsc::RecvTimeoutError::Timeout) | Err(mpsc::RecvTimeoutError::Disconnected) => {
@@ -293,13 +419,23 @@ fn main() -> Result<()> {
                             }
                         }
                         state = s;
-                        bar.draw(&mut buf, &state);
                     }
                 }
-                // 状態が同じでも再ブリット(fbterm/fbhalf 再描画で消された場合の復活)。
-                // スワイプ表示中は clip が効くまでの取りこぼしをここで埋める。
+                // 再生情報は毎ティック取り込んで描き直す(進捗バーを進めるため)。
+                np.refresh(&art, &player_shared);
+                np_shown = redraw(&bar, &mut buf, &state, &np);
+
                 if bar_shown {
-                    fb.blit(0, bar_y, screen_w, bar_h, &buf)?;
+                    // 全面ブリットは 1 秒に 1 回(fbterm/fbhalf の再描画で消された
+                    // ときの復活用)。その合間はパネル部分だけを部分ブリットして
+                    // /dev/fb0 への書き込み量を抑える。
+                    if last_full.elapsed() >= FULL_BLIT_EVERY {
+                        fb.blit(0, bar_y, screen_w, bar_h, &buf)?;
+                        last_full = Instant::now();
+                    } else if np_shown {
+                        let r = bar.np_rect();
+                        fb.blit(r.x, bar_y + r.y, r.w, r.h, &sub_rect(&buf, screen_w, r))?;
+                    }
                 }
             }
         }

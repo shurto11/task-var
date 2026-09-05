@@ -3,10 +3,11 @@
 //! - tmux アイコン(session=None)は例外で、常に現セッション内の新規ウィンドウで
 //!   tmux-session スイッチャーを起動する。
 //! - それ以外は「セッションがあれば switch のみ / なければ作成してコマンド実行 → switch」。
+//! - Spotify の再生情報はバー右側のパネル(bar.rs)が担当するので、ここから
+//!   spotatui-pip デーモンを起動することはしない。
 
 use crate::tmux;
 use anyhow::{bail, Context, Result};
-use std::process::{Command, Stdio};
 
 pub struct IconDef {
     pub name: &'static str,
@@ -49,32 +50,8 @@ fn session_command(session: &str) -> String {
     }
 }
 
-/// spotatui-pip デーモンが動いていなければ起動する(fb 右下の再生情報ウィジェット)。
-/// 既定のまま起動すると右下でタスクバーと上書き合戦になるため、
-/// --margin をバー高さぶん取ってバーの上に配置する。
-fn ensure_spotatui_pip(bar_h: u32) {
-    let running = Command::new("pgrep")
-        .args(["-x", "spotatui-pip"])
-        .output()
-        .is_ok_and(|o| o.status.success());
-    if running {
-        return;
-    }
-    let margin = (bar_h + 6).to_string();
-    match Command::new("spotatui-pip")
-        .args(["--margin", &margin])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-    {
-        Ok(_) => eprintln!("task-var: spotatui-pip を起動 (--margin {margin})"),
-        Err(e) => eprintln!("task-var: spotatui-pip 起動失敗: {e}"),
-    }
-}
-
-/// アイコンがタップされたときの動作。bar_h は spotatui-pip の配置マージンに使う。
-pub fn activate(def: &IconDef, state: &tmux::State, bar_h: u32) -> Result<()> {
+/// アイコンがタップされたときの動作。
+pub fn activate(def: &IconDef, state: &tmux::State) -> Result<()> {
     let client = state.client.as_deref().context("fbterm の tmux クライアントが見つかりません")?;
 
     let Some(session) = def.session else {
@@ -88,9 +65,6 @@ pub fn activate(def: &IconDef, state: &tmux::State, bar_h: u32) -> Result<()> {
         return tmux::new_window(current, &bin);
     };
 
-    if session == "spotify" {
-        ensure_spotatui_pip(bar_h);
-    }
     if !state.existing.iter().any(|s| s == session) {
         eprintln!("task-var: セッション {session} を新規作成");
         tmux::new_session(session, &session_command(session))?;
