@@ -64,6 +64,15 @@ fn env_u32(name: &str, default: u32) -> u32 {
     std::env::var(name).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
 }
 
+/// 文字サイズ用。0 以下や解析できない値は既定へ落とす。
+fn env_f32(name: &str, default: f32) -> f32 {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.trim().parse::<f32>().ok())
+        .filter(|v| *v > 0.0)
+        .unwrap_or(default)
+}
+
 /// バーローカル座標の矩形。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Rect {
@@ -165,8 +174,13 @@ impl NpLayout {
             btn_xs,
             btn_y,
             prog,
-            title_px: (content_h as f32 * 0.25).clamp(11.0, 24.0),
-            artist_px: (content_h as f32 * 0.21).clamp(10.0, 20.0),
+            // 既定はパネル高から算出する。好みで詰めたいときは
+            // TASKVAR_TITLE_PX / TASKVAR_ARTIST_PX で上書きできる
+            // (行に収まる範囲へ丸めるので、曲名とアーティストは重ならない)。
+            title_px: env_f32("TASKVAR_TITLE_PX", (content_h as f32 * 0.25).clamp(11.0, 24.0))
+                .clamp(6.0, row1_h as f32),
+            artist_px: env_f32("TASKVAR_ARTIST_PX", (content_h as f32 * 0.21).clamp(10.0, 20.0))
+                .clamp(6.0, row2_h as f32),
         }
     }
 
@@ -658,6 +672,22 @@ mod tests {
         let p = bar.np_rect();
         let off = (((p.y + 2) * w + p.x + p.w / 2) * 4) as usize;
         assert_eq!([buf[off], buf[off + 1], buf[off + 2]], BG, "パネル無しなら黒のまま");
+    }
+
+    #[test]
+    fn env_f32_parses_or_falls_back() {
+        // 他のテストと衝突しないよう専用の変数名を使う
+        const K: &str = "TASKVAR_TEST_ENV_F32";
+        std::env::set_var(K, "13.5");
+        assert_eq!(env_f32(K, 1.0), 13.5);
+        std::env::set_var(K, " 20 ");
+        assert_eq!(env_f32(K, 1.0), 20.0, "前後の空白は無視する");
+        for bad in ["0", "-3", "abc", ""] {
+            std::env::set_var(K, bad);
+            assert_eq!(env_f32(K, 7.0), 7.0, "{bad:?} は既定へ落ちる");
+        }
+        std::env::remove_var(K);
+        assert_eq!(env_f32(K, 7.0), 7.0);
     }
 
     #[test]
