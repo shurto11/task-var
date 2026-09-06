@@ -1,7 +1,7 @@
 //! タスクバーのレイアウト・描画・当たり判定。
 //!
-//! バーは画面下部の全幅の帯(BGRA バッファ)。左側にセッション切替の白円アイコンを
-//! 横一列、右側に Spotify の再生情報パネルを置く。
+//! バーは画面下部の全幅の帯(BGRA バッファ)。左に clawd 枠、中央にセッション切替の
+//! 白円アイコンを横一列、右に Spotify の再生情報パネルを置く。
 //! 外枠リング: 表示中セッション=青 / 存在するが非表示=灰 / セッション無し=枠なし。
 //! tmux アイコンはセッションに対応しないため、「名前付きセッション以外を表示中」の
 //! ときに青リングにする(通常の作業セッションにいる状態を表す)。
@@ -9,11 +9,10 @@
 //! 再生情報パネルは 2 行 3 列:
 //!   列① アルバムアート(2 行ぶち抜き) / 列② 曲名・アーティスト /
 //!   列③ 操作ボタン 5 個・進捗バー
-//! アイコン列は左寄せ固定。中央寄せだとパネルに必要な幅(既定 560px)が
-//! 取れず、曲名が数文字で切れてしまうため。
 //!
-//! アイコン列と再生情報パネルの間には clawd 枠。動いている Claude Code を
-//! キャラクター + tmux セッション名で最大 4 行ぶん縦に並べる(旧 touch-claude)。
+//! clawd 枠には動いている Claude Code をキャラクター + 作業の要約で最大 4 行ぶん
+//! 縦に並べる(旧 touch-claude)。枠は左端から、アイコン列の手前までの残り全部。
+//! アイコン列はその clawd 枠と再生情報パネルの間の中央に置く。
 
 use crate::actions::{IconDef, ICONS};
 use crate::art::Accent;
@@ -27,20 +26,35 @@ use crate::tmux::State;
 use anyhow::Result;
 
 // 色はすべて BGR 順(バッファが BGRA のため)。
-const BG: [u8; 3] = [0, 0, 0];
+/// バーの地色 #D6E0FA。
+const BG: [u8; 3] = [0xFA, 0xE0, 0xD6];
 const WHITE: [u8; 3] = [255, 255, 255];
+/// 白円の上に乗せるグリフの色(再生/停止ボタン)。地色とは独立。
+const BLACK: [u8; 3] = [0, 0, 0];
 const BLUE: [u8; 3] = [255, 144, 30]; // #1E90FF
 const GRAY: [u8; 3] = [128, 128, 128];
 /// リングの太さ(px)。
 const RING_W: f32 = 4.0;
 
-// Spotify のブランドカラー。
-const PANEL: [u8; 3] = [0x12, 0x12, 0x12]; // #121212 ベース
-const PANEL_EDGE: [u8; 3] = [0x28, 0x28, 0x28]; // #282828 枠線
+// 影。明るい地色の上でアイコンの白円と 2 つの枠が浮いて見えるように真下へ敷く。
+/// 影の色(#1E2D5A 相当)。地色が青みなので黒ではなく暗い青にする。
+const SHADOW: [u8; 3] = [0x5A, 0x2D, 0x1E];
+/// 円の真下での影の濃さ。ここからぼかし幅ぶんかけて 0 へ落とす。
+const SHADOW_A: f32 = 0.30;
+/// 影のぼかし幅(px)。円の外側へこのぶん広がる。
+const SHADOW_BLUR: f32 = 7.0;
+/// 影を下へずらす量(px)。光が上から当たっているように見せる。
+const SHADOW_DY: f32 = 3.0;
+
+// 枠の色。Spotify の #121212 ではなく、地色 #D6E0FA と同じ色相(222°)の暗色へ
+// 落とす。無彩色の黒だと明るい地色の上で色が浮いて、板が穴のように見えるため。
+// ブランド色そのもの(グリーン)は動かさない。
+const PANEL: [u8; 3] = [0x33, 0x1E, 0x16]; // #161E33 ベース
+const PANEL_EDGE: [u8; 3] = [0x5E, 0x40, 0x33]; // #33405E 枠線
 const GREEN: [u8; 3] = [0x60, 0xD7, 0x1E]; // #1ED760 アクセント
 const SUB_TEXT: [u8; 3] = [0xB3, 0xB3, 0xB3]; // #B3B3B3 アーティスト名
-const GROOVE: [u8; 3] = [0x53, 0x53, 0x53]; // #535353 進捗バーの溝
-const ART_BG: [u8; 3] = [0x28, 0x28, 0x28]; // アート未取得時の下地
+const GROOVE: [u8; 3] = [0x78, 0x55, 0x4A]; // #4A5578 進捗バーの溝
+const ART_BG: [u8; 3] = [0x50, 0x30, 0x26]; // #263050 アート未取得時の下地
 // 背景のグラデーション。左端の色はアルバムアートから採る(art::Accent)。
 /// グラデーションが単色へ落ち着くまでの横幅(パネル幅に対する割合)。
 /// ボタン列(左から約 60%)より手前で落とし切り、白いグリフを素の暗色に乗せる。
@@ -107,6 +121,15 @@ const CLAWD_MIN_W: u32 = 96;
 const CLAWD_BOB: u32 = 2;
 /// 走りアニメーションの 1 コマの長さ。
 pub const CLAWD_BOB_MS: u128 = 300;
+/// 見出しの色。枠を持たず地色の上に直接置くので黒。
+const CLAWD_NAME: [u8; 3] = [0x1A, 0x1A, 0x14]; // #141A1A
+/// 確認済み(灰)の行の見出し。黒より落として控えめにする。
+const CLAWD_NAME_SEEN: [u8; 3] = [0x8C, 0x82, 0x78]; // #78828C
+/// キャラの影の濃さ。円や枠(`SHADOW_A`)より薄くする。
+const CLAWD_SHADOW_A: f32 = 0.18;
+/// キャラの影のずらし量(px)。キャラが小さいので円より小さく。
+const CLAWD_SHADOW_DX: u32 = 1;
+const CLAWD_SHADOW_DY: u32 = 2;
 
 // 状態ごとのキャラの色(BGR)。処理中は元画像のオレンジをそのまま使う。
 const CLAWD_ASK: [u8; 3] = [217, 144, 74]; // #4A90D9
@@ -174,7 +197,9 @@ struct NpLayout {
     artist_px: f32,
 }
 
-const MARGIN: u32 = 12; // 画面右端からの余白
+/// バーの左右端からの余白。clawd 枠の左端と再生情報パネルの右端で同じ値を使う
+/// (左右対称にするため)。`TASKVAR_MARGIN` で変えられる。
+const MARGIN: u32 = 12;
 const INSET: u32 = 4; // バー上下からの余白
 const PAD: u32 = 8; // パネル内側の余白
 const GAP: u32 = 12; // 列間
@@ -186,7 +211,8 @@ const CTRL_GAP: u32 = 16;
 ///
 /// 既定はパネル幅(`np_w`)が主で、列②(曲名・アーティスト)はその余りを取る。
 /// `text_w` が指定されたときは列②を主にし、パネル幅の方を逆算する。
-/// どちらの場合も、アイコン列に重ならない範囲 `avail` で頭打ちにする。
+/// どちらの場合も、左側(clawd 枠・アイコン列)に重ならない範囲 `avail` で
+/// 頭打ちにする。
 fn panel_width(avail: u32, np_w: u32, text_w: Option<u32>, art: u32, col3: u32) -> u32 {
     match text_w {
         Some(t) => PAD * 2 + art + GAP + t + GAP + col3,
@@ -196,9 +222,10 @@ fn panel_width(avail: u32, np_w: u32, text_w: Option<u32>, art: u32, col3: u32) 
 }
 
 impl NpLayout {
-    /// バー幅 w・高さ h と、アイコン列の右端 icons_right から算出する。
-    /// パネルがアイコンに重ならないよう幅を切り詰める。
-    fn new(w: u32, h: u32, icons_right: u32) -> Self {
+    /// バー幅 w・高さ h、バー端からの余白 margin、パネルに使える最大幅 avail
+    /// から算出する。avail は呼び手が「同じ幅の clawd 枠とアイコン列が左に並ぶ」
+    /// ぶんを差し引いて渡す(`Bar::new`)。
+    fn new(w: u32, h: u32, margin: u32, avail: u32) -> Self {
         let panel_h = h.saturating_sub(INSET * 2);
         let content_h = panel_h - PAD * 2;
         // 行の分割は content_h だけで決まる(上段=曲名/ボタン、下段=アーティスト/進捗バー)。
@@ -218,7 +245,6 @@ impl NpLayout {
             env_opt_u32(BTN_ENV[i]).or(base).unwrap_or(BTN_D_DEFAULT[i]).min(btn_cap)
         });
         let want_col3 = want.iter().sum::<u32>() + BTN_GAP * 4;
-        let avail = w.saturating_sub(MARGIN).saturating_sub(icons_right + GAP);
         let panel_w = panel_width(
             avail,
             env_u32("TASKVAR_NP_W", 400),
@@ -226,7 +252,7 @@ impl NpLayout {
             content_h,
             want_col3,
         );
-        let panel = Rect { x: w - MARGIN - panel_w, y: INSET, w: panel_w, h: panel_h };
+        let panel = Rect { x: w - margin - panel_w, y: INSET, w: panel_w, h: panel_h };
 
         let content_x = panel.x + PAD;
         let content_y = panel.y + PAD;
@@ -330,15 +356,13 @@ struct ClawdLayout {
 }
 
 impl ClawdLayout {
-    /// アイコン列の右端と再生情報パネルの左端の間に置く。
+    /// バーの左端 x に幅 want で置く(want は再生情報パネルと同じ幅)。
     /// 幅が足りなければ None(枠ごと出さない)。
     ///
     /// パネルの有無で幅を変えたりはしない。曲が止まって再生情報が消えるたびに
     /// 枠が伸び縮みすると、タップ先が動いて押し間違えるため。
-    fn new(h: u32, icons_right: u32, np_left: u32) -> Option<Self> {
-        let x = icons_right + GAP;
-        let avail = np_left.saturating_sub(GAP).saturating_sub(x);
-        let panel_w = env_opt_u32("TASKVAR_CLAWD_W").unwrap_or(avail).min(avail);
+    fn new(h: u32, x: u32, want: u32) -> Option<Self> {
+        let panel_w = env_opt_u32("TASKVAR_CLAWD_W").unwrap_or(want);
         if panel_w < CLAWD_MIN_W {
             return None;
         }
@@ -412,8 +436,6 @@ pub struct Bar {
     clawd: Option<ClawdLayout>,
     /// キャラのスプライト。読めなければ枠を出さない。
     sprite: Option<Sprite>,
-    /// clawd 枠の背景グラデーションの起点色。キャラのオレンジから採る。
-    clawd_accent: Accent,
 }
 
 impl Bar {
@@ -422,14 +444,20 @@ impl Bar {
         let gap = env_u32("TASKVAR_GAP", 24);
         let n = ICONS.len() as u32;
         let total = n * circle_d + (n - 1) * gap;
-        // アイコン列は左寄せ固定(右側の再生情報パネルに幅を譲るため)。
-        let x0 = env_u32("TASKVAR_MARGIN", 24).min(w.saturating_sub(total));
-        let xs: Vec<u32> = (0..n).map(|i| x0 + i * (circle_d + gap)).collect();
+        // 左右端の余白は共通(左は clawd 枠、右は再生情報パネルが接する)。
+        let margin = env_u32("TASKVAR_MARGIN", MARGIN);
         let tile_y = (h - circle_d) / 2;
         let glyph_px = circle_d * 58 / 100;
         let glyphs = ICONS.iter().map(|d| icons::render(d.svg, glyph_px)).collect::<Result<_>>()?;
 
-        let np = NpLayout::new(w, h, x0 + total);
+        // 左から clawd 枠・アイコン列・再生情報パネルの順。幅は
+        // 「パネル → 同じ幅の clawd 枠 → 残りにアイコン列」の順に決まる。
+        // 左右の枠が同じ幅なので、パネルに使える幅は
+        // 「アイコン列と余白を除いた残りの半分」が上限になる。
+        let avail = w.saturating_sub(margin * 2 + GAP * 2 + total) / 2;
+        let np = NpLayout::new(w, h, margin, avail);
+        // clawd 枠はパネルと同じ幅で左端へ(左右が揃って中央のアイコン列が引き立つ)。
+        let clawd = ClawdLayout::new(h, margin, np.panel.w);
         let ctrl = CTRL_SVGS
             .iter()
             .enumerate()
@@ -446,9 +474,16 @@ impl Bar {
                 icons::render(svg, px.max(1))
             })
             .collect::<Result<_>>()?;
-        let art_fallback = icons::render(ICONS[1].svg, (np.art.w * 55 / 100).max(1))?;
+        let art_fallback =
+            icons::render(crate::actions::SPOTIFY.svg, (np.art.w * 55 / 100).max(1))?;
 
-        let clawd = ClawdLayout::new(h, x0 + total, np.panel.x);
+        // アイコン列は clawd 枠と再生情報パネルの間の中央。枠を出せなかったときは
+        // バーの左端からの残り全部を間とみなす。
+        let icons_x = clawd.as_ref().map(|l| l.panel.x + l.panel.w + GAP).unwrap_or(margin);
+        let icons_right = np.panel.x.saturating_sub(GAP);
+        let x0 = icons_x + icons_right.saturating_sub(icons_x).saturating_sub(total) / 2;
+        let xs: Vec<u32> = (0..n).map(|i| x0 + i * (circle_d + gap)).collect();
+
         let sprite = match sprite::load() {
             Ok(s) => Some(s),
             Err(e) => {
@@ -456,10 +491,6 @@ impl Bar {
                 None
             }
         };
-
-        // 起点色は画像のオレンジから 1 回だけ採る(毎フレーム計算する必要はない)。
-        let clawd_accent =
-            sprite.as_ref().map(|s| Accent::from_bgr(s.body)).unwrap_or_default();
 
         Ok(Self {
             w,
@@ -474,7 +505,6 @@ impl Bar {
             np,
             clawd,
             sprite,
-            clawd_accent,
         })
     }
 
@@ -512,6 +542,11 @@ impl Bar {
         for px in buf.chunks_exact_mut(4) {
             px.copy_from_slice(&[BG[0], BG[1], BG[2], 0]);
         }
+        // 影は全タイルぶんを先に敷く。1 タイルずつ影→円と描くと、
+        // 間隔を詰めたときに隣の影が円の上へ乗ってしまうため。
+        for &x0 in &self.xs {
+            self.draw_shadow(buf, x0);
+        }
         for (i, def) in ICONS.iter().enumerate() {
             self.draw_tile(buf, self.xs[i], ring_color(def, state), &self.glyphs[i]);
         }
@@ -531,16 +566,9 @@ impl Bar {
     fn draw_clawd(&self, buf: &mut [u8], view: &ClawdView) {
         let Some(l) = &self.clawd else { return };
 
-        // 枠は再生情報パネルと同じ作り: 左端からパネル幅の 65% までで #121212 へ
-        // 落とす斜めのグラデーション。起点の色は**キャラのオレンジから採る**
-        // (`Accent::from_bgr`)。アートのときと同じで色相と彩度だけを受け取り、
-        // 明度は固定なので、見出しの白文字のコントラストは保たれる。
-        round_rect_grad(buf, self.w, self.h, l.panel, 10.0, self.clawd_accent.edge, PANEL_EDGE);
-        let inner =
-            Rect { x: l.panel.x + 1, y: l.panel.y + 1, w: l.panel.w - 2, h: l.panel.h - 2 };
-        round_rect_grad(buf, self.w, self.h, inner, 9.0, self.clawd_accent.fill, PANEL);
-
-        // キャラの画像が読めなかったときは枠だけで止める(行は出せない)。
+        // 枠(背景・枠線)は持たない。キャラと見出しを地色の上へ直接置き、
+        // 影で浮かせる。場所そのものは `ClawdLayout` が確保したまま動かさない
+        // ので、claude が居ても居なくてもタップ先はずれない。
         let Some(sprite) = &self.sprite else { return };
 
         for (row, r) in view.rows.iter().zip(l.rows.iter()) {
@@ -558,9 +586,22 @@ impl Bar {
             };
             let bgra = sprite.render(l.sprite_w, sh, body);
             let sy = r.y + (r.h - l.sprite_h) / 2 + dy;
+            // キャラの形そのままの影を右下へ薄く敷いてから本体を重ねる
+            let shade = sprite.render(l.sprite_w, sh, SHADOW);
+            blit_alpha_scaled(
+                buf,
+                self.w,
+                self.h,
+                r.x + CLAWD_SHADOW_DX,
+                sy + CLAWD_SHADOW_DY,
+                l.sprite_w,
+                sh,
+                &shade,
+                CLAWD_SHADOW_A,
+            );
             blit_alpha(buf, self.w, self.h, r.x, sy, l.sprite_w, sh, &bgra);
 
-            // キャラの右に見出し(作業の要約 / ディレクトリ名)。
+            // キャラの右に見出し(作業の要約 / ディレクトリ名)。地色が明るいので黒。
             // 確認済み(灰)は文字も落として控えめにする。
             let Some(font) = &self.font else { continue };
             let tx = r.x + l.sprite_w + CLAWD_NAME_GAP;
@@ -570,9 +611,30 @@ impl Bar {
             }
             let px = font.shrink_to_fit(&row.label, max, l.name_px, CLAWD_NAME_MIN_PX);
             let text = font.fit(&row.label, max, px);
-            let color = if row.st == St::Seen { SUB_TEXT } else { WHITE };
+            let color = if row.st == St::Seen { CLAWD_NAME_SEEN } else { CLAWD_NAME };
             let base = r.y as f32 + r.h as f32 / 2.0 + px * 0.35;
             font.draw(buf, self.w, self.h, tx as f32, base, px, color, &text);
+        }
+    }
+
+    /// タイル 1 個ぶんの影。円をそのまま下へずらし、縁を `SHADOW_BLUR` かけて
+    /// 滑らかに消す(内側は円が塗りつぶすので見えるのは外へはみ出したぶんだけ)。
+    fn draw_shadow(&self, buf: &mut [u8], x0: u32) {
+        let r = self.circle_d as f32 / 2.0;
+        let cx = x0 as f32 + r;
+        let cy = self.tile_y as f32 + r + SHADOW_DY;
+        let reach = r + SHADOW_BLUR;
+        let x_min = (cx - reach).floor().max(0.0) as u32;
+        let y_min = (cy - reach).floor().max(0.0) as u32;
+        let x_max = ((cx + reach).ceil() as u32).min(self.w.saturating_sub(1));
+        let y_max = ((cy + reach).ceil() as u32).min(self.h.saturating_sub(1));
+        for y in y_min..=y_max {
+            for x in x_min..=x_max {
+                let (dx, dy) = (x as f32 + 0.5 - cx, y as f32 + 0.5 - cy);
+                let t = ((reach - (dx * dx + dy * dy).sqrt()) / SHADOW_BLUR).clamp(0.0, 1.0);
+                // 線形のままだと縁が輪郭に見えるので smoothstep で落とす
+                blend(buf, self.w, self.h, x, y, SHADOW, t * t * (3.0 - 2.0 * t) * SHADOW_A);
+            }
         }
     }
 
@@ -591,16 +653,18 @@ impl Bar {
                 let cov_out = (r_out - dist + 0.5).clamp(0.0, 1.0);
                 let cov_in = (r_in - dist + 0.5).clamp(0.0, 1.0);
                 if cov_out <= 0.0 {
-                    continue; // タイル外周はバー背景のまま
+                    continue; // タイル外周は下地(地色と影)のまま
                 }
+                let off = (((self.tile_y + j) * self.w + x0 + i) * 4) as usize;
                 let mut px = [0u8; 3];
                 for k in 0..3 {
-                    let v = BG[k] as f32 * (1.0 - cov_out)
+                    // 縁の半端なカバレッジは下地へ溶かす。下には影が敷いてあるので、
+                    // BG 固定にすると円のまわりだけ影が抜けて白く縁取られてしまう。
+                    let v = buf[off + k] as f32 * (1.0 - cov_out)
                         + ring_c[k] as f32 * (cov_out - cov_in)
                         + WHITE[k] as f32 * cov_in;
                     px[k] = v.round() as u8;
                 }
-                let off = (((self.tile_y + j) * self.w + x0 + i) * 4) as usize;
                 buf[off..off + 3].copy_from_slice(&px);
                 buf[off + 3] = 0;
             }
@@ -611,6 +675,7 @@ impl Bar {
     /// パネルの下地。枠線の角丸矩形の内側を 1px 詰めて塗る。
     fn draw_np_bg(&self, buf: &mut [u8], accent: Accent) {
         let p = self.np.panel;
+        round_rect_shadow(buf, self.w, self.h, p, 10.0);
         round_rect_grad(buf, self.w, self.h, p, 10.0, accent.edge, PANEL_EDGE);
         let inner = Rect { x: p.x + 1, y: p.y + 1, w: p.w - 2, h: p.h - 2 };
         round_rect_grad(buf, self.w, self.h, inner, 9.0, accent.fill, PANEL);
@@ -697,7 +762,7 @@ impl Bar {
                 circle(buf, self.w, self.h, x, y, d, WHITE);
                 let g = &self.ctrl[if p.playing { G_PAUSE } else { G_PLAY }];
                 let off = (d - g.px) / 2;
-                tint_glyph(buf, self.w, self.h, x + off, y + off, g, BG);
+                tint_glyph(buf, self.w, self.h, x + off, y + off, g, BLACK);
                 return;
             }
         };
@@ -796,6 +861,32 @@ fn round_rect_grad(
 }
 
 /// 角丸矩形を単色で塗る。
+/// 角丸矩形(2 つの枠)の影。アイコンの円と同じで、矩形を `SHADOW_DY` だけ下へ
+/// ずらし、縁を `SHADOW_BLUR` かけて消す。距離は角丸矩形の符号付き距離で測る。
+fn round_rect_shadow(buf: &mut [u8], w: u32, h: u32, rect: Rect, r: f32) {
+    let (cx, cy) = (
+        rect.x as f32 + rect.w as f32 / 2.0,
+        rect.y as f32 + rect.h as f32 / 2.0 + SHADOW_DY,
+    );
+    let (hx, hy) = (rect.w as f32 / 2.0, rect.h as f32 / 2.0);
+    let x0 = (cx - hx - SHADOW_BLUR).floor().max(0.0) as u32;
+    let y0 = (cy - hy - SHADOW_BLUR).floor().max(0.0) as u32;
+    let x1 = ((cx + hx + SHADOW_BLUR).ceil() as u32).min(w.saturating_sub(1));
+    let y1 = ((cy + hy + SHADOW_BLUR).ceil() as u32).min(h.saturating_sub(1));
+    for y in y0..=y1 {
+        for x in x0..=x1 {
+            let dx = (x as f32 + 0.5 - cx).abs() - (hx - r);
+            let dy = (y as f32 + 0.5 - cy).abs() - (hy - r);
+            // 角丸矩形の符号付き距離(内側が負、外側が正)
+            let out = (dx.max(0.0).powi(2) + dy.max(0.0).powi(2)).sqrt();
+            let d = out + dx.max(dy).min(0.0) - r;
+            // 縁(d=0)で最大、外へ SHADOW_BLUR ぶんかけて 0 へ落とす
+            let t = ((SHADOW_BLUR - d) / SHADOW_BLUR).clamp(0.0, 1.0);
+            blend(buf, w, h, x, y, SHADOW, t * t * (3.0 - 2.0 * t) * SHADOW_A);
+        }
+    }
+}
+
 fn round_rect(buf: &mut [u8], w: u32, h: u32, rect: Rect, r: f32, color: [u8; 3]) {
     round_rect_grad(buf, w, h, rect, r, color, color);
 }
@@ -827,6 +918,31 @@ fn blit_round(buf: &mut [u8], w: u32, h: u32, rect: Rect, src: &[u8], r: f32) {
 /// ストレートアルファの BGRA を下地へ合成する(clawd のスプライト用)。
 /// α をカバレッジとして扱うので、縮小でぼけた輪郭が枠の色へなじむ。
 #[allow(clippy::too_many_arguments)]
+/// `blit_alpha` の α を a 倍して重ねる版。キャラの影に使う。
+#[allow(clippy::too_many_arguments)]
+fn blit_alpha_scaled(
+    buf: &mut [u8],
+    w: u32,
+    h: u32,
+    x0: u32,
+    y0: u32,
+    sw: u32,
+    sh: u32,
+    src: &[u8],
+    a: f32,
+) {
+    for j in 0..sh {
+        for i in 0..sw {
+            let s = ((j * sw + i) * 4) as usize;
+            if src[s + 3] == 0 {
+                continue;
+            }
+            let cov = src[s + 3] as f32 / 255.0 * a;
+            blend(buf, w, h, x0 + i, y0 + j, [src[s], src[s + 1], src[s + 2]], cov);
+        }
+    }
+}
+
 fn blit_alpha(buf: &mut [u8], w: u32, h: u32, x0: u32, y0: u32, sw: u32, sh: u32, src: &[u8]) {
     for j in 0..sh {
         for i in 0..sw {
@@ -885,9 +1001,14 @@ fn ring_color(def: &IconDef, state: &State) -> Option<[u8; 3]> {
                 None
             }
         }
-        // tmux アイコン: 名前付きセッション以外(=通常の作業セッション)を表示中なら青
+        // tmux アイコン: 名前付きセッション以外(=通常の作業セッション)を表示中なら青。
+        // spotify はアイコン列に居ないが名前付きセッションではあるので数に入れる。
         None => {
-            let named: Vec<&str> = ICONS.iter().filter_map(|d| d.session).collect();
+            let named: Vec<&str> = ICONS
+                .iter()
+                .chain(std::iter::once(crate::actions::spotify()))
+                .filter_map(|d| d.session)
+                .collect();
             match state.current.as_deref() {
                 Some(cur) if !named.contains(&cur) => Some(BLUE),
                 _ => None,
@@ -923,12 +1044,16 @@ mod tests {
 
     #[test]
     fn ring_colors_follow_session_state() {
-        // ICONS: [tmux, spotify, shorts, bluetooth, ssbrowse, eduroam, calendar]
-        let st = state("spotify", &["spotify", "bluetooth"]);
-        assert_eq!(ring_color(&ICONS[1], &st), Some(BLUE), "表示中は青");
-        assert_eq!(ring_color(&ICONS[3], &st), Some(GRAY), "存在するが非表示は灰");
-        assert_eq!(ring_color(&ICONS[2], &st), None, "セッション無しは枠なし");
+        // ICONS: [tmux, shorts, bluetooth, ssbrowse, eduroam, calendar]
+        // (spotify は再生情報パネルが受け持つのでアイコン列には並べない)
+        let st = state("bluetooth", &["bluetooth", "shorts"]);
+        assert_eq!(ring_color(&ICONS[2], &st), Some(BLUE), "表示中は青");
+        assert_eq!(ring_color(&ICONS[1], &st), Some(GRAY), "存在するが非表示は灰");
+        assert_eq!(ring_color(&ICONS[3], &st), None, "セッション無しは枠なし");
         assert_eq!(ring_color(&ICONS[0], &st), None, "名前付きセッション表示中のtmuxは枠なし");
+        // spotify も名前付きセッション。アイコンが無くても tmux は枠なしのまま
+        let sp = state("spotify", &["spotify"]);
+        assert_eq!(ring_color(&ICONS[0], &sp), None, "spotify 表示中のtmuxは枠なし");
         let st2 = state("main", &["main", "spotify"]);
         assert_eq!(ring_color(&ICONS[0], &st2), Some(BLUE), "通常セッション表示中のtmuxは青");
     }
@@ -949,7 +1074,7 @@ mod tests {
         let (w, h) = (1366u32, 96u32);
         let bar = Bar::new(w, h).unwrap();
         let mut buf = vec![0u8; (w * h * 4) as usize];
-        let st = state("spotify", &["spotify"]);
+        let st = state("shorts", &["shorts"]);
         let np = now_playing();
         // TASKVAR_TEST_ART=画像パス で実際のジャケットを流し込める
         // (アートから採る背景色を目視で確かめるため)。
@@ -969,16 +1094,28 @@ mod tests {
         let (cx, cy) = (bar.xs[1] + bar.circle_d / 2, bar.tile_y + bar.circle_d / 2);
         // 白円内・グリフ外の点は白(グリフはd*58%なので中心から±d*0.29まで)
         assert_eq!(px(&buf, cx + bar.circle_d * 38 / 100, cy), WHITE);
-        // リング帯(半径 d/2 - RING_W/2 付近)は spotify=表示中 → 青
+        // リング帯(半径 d/2 - RING_W/2 付近)は shorts=表示中 → 青
         assert_eq!(px(&buf, cx + bar.circle_d / 2 - 2, cy), BLUE);
 
-        // アイコン列は左寄せ。1 個目の左端が既定マージンにある
-        assert_eq!(bar.xs[0], 24, "アイコン列は左寄せ");
-        // アイコン列とパネルの間は素通しの背景
-        let icons_right = bar.xs[6] + bar.circle_d;
-        assert_eq!(px(&buf, icons_right + 4, cy), BG);
+        // アイコン列は clawd 枠とパネルの間の中央。左右の余りが揃っている
+        let icons_right = bar.xs[ICONS.len() - 1] + bar.circle_d;
+        let l = bar.clawd.as_ref().unwrap();
+        let left_gap = bar.xs[0] - (l.panel.x + l.panel.w);
+        let right_gap = bar.np_rect().x - icons_right;
+        assert!(left_gap.abs_diff(right_gap) <= 1, "中央でない: 左 {left_gap} / 右 {right_gap}");
+        // 円から離れた場所は素通しの地色(影はぼかし幅ぶんしか届かない)
+        assert_eq!(px(&buf, icons_right + 4, 2), BG);
+        assert_eq!(px(&buf, l.panel.x + l.panel.w + 4, 2), BG);
 
-        // パネルは黒ではなく Spotify のパネル色で塗られている
+        // 円の真下には影。地色より暗く、下へ離れるほど薄くなって地色へ戻る
+        let below = |dy: u32| px(&buf, cx, bar.tile_y + bar.circle_d + dy);
+        let near = below(1);
+        assert!(near.iter().zip(BG).all(|(a, b)| *a < b), "円の下に影が無い: {near:?}");
+        let far = below(SHADOW_BLUR as u32 + SHADOW_DY as u32);
+        assert_eq!(far, BG, "影がぼかし幅より先まで届いている");
+        assert!(near[2] < below(3)[2], "下へ行くほど薄くなっていない");
+
+        // パネルは地色ではなく Spotify のパネル色で塗られている
         let p = bar.np_rect();
         assert!(p.x > icons_right, "パネルはアイコン列より右");
         // 背景は左端が accent(既定は Spotify グリーン、アートがあればその色)、
@@ -990,6 +1127,9 @@ mod tests {
             view.accent.fill
         );
         assert_eq!(px(&buf, p.x + p.w - 4, p.y + p.h / 2), PANEL, "右端は素のパネル色");
+        // 枠にもアイコンと同じ影。パネルのすぐ左は地色より暗い
+        let side = px(&buf, p.x - 2, p.y + p.h / 2);
+        assert!(side.iter().zip(BG).all(|(a, b)| *a < b), "枠の外に影が無い: {side:?}");
 
         // 進捗バー: 塗り部分は緑、末尾側は溝の色
         let prog = bar.np.prog;
@@ -1017,8 +1157,10 @@ mod tests {
         let text_y = (p.y + p.h / 2) as f64;
         assert_eq!(bar.hit(bar.np.col2_x as f64 + 4.0, text_y, true, 0), Some(Hit::Panel), "曲名");
         assert_eq!(bar.hit((p.x + 2) as f64, text_y, true, 0), Some(Hit::Panel), "パネル左端");
-        // パネルの外は当たらない。枠だけの状態でもパネル内は遷移のまま
-        assert_eq!(bar.hit((p.x - 4) as f64, text_y, true, 0), None, "パネルの左外");
+        // パネルの外はパネル判定にならない。アイコン列が隣に来たので、
+        // 間の隙間はアイコン側の許容範囲(円の外 8px)が受け持つ
+        assert_ne!(bar.hit((p.x - 4) as f64, text_y, true, 0), Some(Hit::Panel), "パネルの左外");
+        // 枠だけの状態でもパネル内は遷移のまま
         assert_eq!(bar.hit(art_c.0, art_c.1, false, 0), Some(Hit::Panel), "枠だけのアート");
 
         // TASKVAR_TEST_DUMP=path で目視確認用の PPM を書き出す。
@@ -1106,14 +1248,21 @@ mod tests {
     }
 
     #[test]
-    fn clawd_frame_sits_between_the_icons_and_the_panel() {
+    fn clawd_frame_sits_left_of_the_icons() {
         let bar = Bar::new(1366, 96).unwrap();
         assert_eq!(bar.clawd_rows(), CLAWD_ROWS, "既定は 4 行");
         let l = bar.clawd.as_ref().unwrap();
 
-        let icons_right = bar.xs[6] + bar.circle_d;
-        assert!(l.panel.x > icons_right, "アイコン列に重なっている");
-        assert!(l.panel.x + l.panel.w <= bar.np_rect().x, "再生情報パネルに重なっている");
+        // 左から clawd 枠・アイコン列・再生情報パネルの順に並ぶ
+        assert_eq!(l.panel.w, bar.np_rect().w, "枠の幅がパネルと揃っていない");
+        // バー端からの余白も左右で同じ(枠の左端 = パネルの右端から数えた距離)
+        let np = bar.np_rect();
+        assert_eq!(l.panel.x, bar.w - (np.x + np.w), "左右の余白が違う");
+        assert_eq!(l.panel.y, np.y, "上の余白が違う");
+        assert_eq!(l.panel.h, np.h, "高さが違う");
+        assert!(l.panel.x + l.panel.w <= bar.xs[0], "アイコン列に重なっている");
+        let icons_right = bar.xs[ICONS.len() - 1] + bar.circle_d;
+        assert!(icons_right <= bar.np_rect().x, "アイコン列が再生情報パネルに重なっている");
         assert_eq!(bar.clawd_rect(), Some(l.panel));
 
         // 行はすべて枠の内側。上下の余りは均等に散る
@@ -1129,8 +1278,13 @@ mod tests {
         let below = (l.panel.y + l.panel.h) - (l.rows[CLAWD_ROWS - 1].y + l.rows[0].h);
         assert!(above.abs_diff(below) <= 1, "上下の余白が揃っていない: 上 {above} / 下 {below}");
 
-        // 場所が無ければ枠ごと諦める(アイコン列が伸びてパネルと詰まったとき)
-        assert!(ClawdLayout::new(96, 900, 960).is_none(), "狭くても枠を出そうとしている");
+        // 左右の余りが揃う(枠とパネルが同じ幅で、アイコン列が中央にあるため)
+        let left_gap = bar.xs[0] - (l.panel.x + l.panel.w);
+        let right_gap = bar.np_rect().x - icons_right;
+        assert!(left_gap.abs_diff(right_gap) <= 1, "左右非対称: 左 {left_gap} / 右 {right_gap}");
+
+        // パネルが細って場所が無くなれば枠ごと諦める
+        assert!(ClawdLayout::new(96, 24, CLAWD_MIN_W - 1).is_none(), "狭くても枠を出す");
     }
 
     #[test]
@@ -1152,29 +1306,34 @@ mod tests {
         let l = bar.clawd.as_ref().unwrap();
         let sprite = bar.sprite.as_ref().unwrap();
 
-        // 背景は左端がキャラのオレンジ由来の色、右端は素のパネル色へ落ちる
-        let left = px(&buf, l.panel.x + 3, l.panel.y + l.panel.h / 2);
-        assert!(
-            left.iter().zip(bar.clawd_accent.fill).all(|(a, b)| a.abs_diff(b) <= 12),
-            "左端が accent の色になっていない: {left:?} vs {:?}",
-            bar.clawd_accent.fill
-        );
-        assert_eq!(px(&buf, l.panel.x + l.panel.w - 6, l.panel.y + l.panel.h - 4), PANEL);
+        // 枠は持たない。キャラも見出しも無い場所は地色のまま
+        assert_eq!(px(&buf, l.panel.x + 1, l.panel.y + 1), BG, "枠の下地が残っている");
+        assert_eq!(px(&buf, l.panel.x + l.panel.w - 6, l.panel.y + l.panel.h - 4), BG);
 
         // 各行のキャラが状態の色で塗られている
         let has = |buf: &[u8], r: Rect, c: [u8; 3]| {
             (0..l.sprite_w).any(|i| (0..r.h).any(|j| px(buf, r.x + i, r.y + j) == c))
         };
+        let r0 = l.rows[0];
         assert!(has(&buf, l.rows[0], sprite.body), "処理中の行が元のオレンジで描かれていない");
         assert!(has(&buf, l.rows[1], CLAWD_DONE), "終了の行が黄で描かれていない");
-        // 描いていない 3 行目は素のパネル色
+        // 描いていない 3 行目は地色のまま
         assert!(!has(&buf, l.rows[2], sprite.body) && !has(&buf, l.rows[2], CLAWD_DONE));
 
-        // 見出しはキャラの右に出る(パネル色でないピクセルがある)
+        // キャラの右下には薄い影(地色より暗いが、キャラ本体ほど濃くない)
+        let shaded = (0..l.sprite_w + CLAWD_SHADOW_DX).any(|i| {
+            (0..r0.h).any(|j| {
+                let c = px(&buf, r0.x + i, r0.y + j);
+                c != BG && c.iter().zip(BG).all(|(a, b)| *a < b)
+            })
+        });
+        assert!(shaded, "キャラの影が描かれていない");
+
+        // 見出しはキャラの右に黒で出る(地色でないピクセルがある)
         let r = l.rows[0];
         let name_x = r.x + l.sprite_w + CLAWD_NAME_GAP;
         assert!(
-            (name_x..r.x + r.w).any(|x| (r.y..r.y + r.h).any(|y| px(&buf, x, y) != PANEL)),
+            (name_x..r.x + r.w).any(|x| (r.y..r.y + r.h).any(|y| px(&buf, x, y) != BG)),
             "見出しが描かれていない(フォントが無い環境かもしれない)"
         );
 
@@ -1188,20 +1347,14 @@ mod tests {
         assert_eq!(bar.hit(x2, y2, false, rows.len()), None, "描いていない行は当たらない");
         assert_eq!(bar.hit(x0, y0, false, 0), None, "枠が空なら当たらない");
 
-        // 行が無くても枠だけは残る(キャラも見出しも出ない)
+        // 行が無ければ場所ごと地色のまま(枠を持たないので何も残らない)。
+        // 場所は `ClawdLayout` が確保したままなのでタップ先はずれない
         let mut empty = vec![0u8; (w * h * 4) as usize];
         bar.draw(&mut empty, &st, None, Some(&ClawdView { rows: &[], phase: false }));
-        let left = px(&empty, l.panel.x + 3, l.panel.y + l.panel.h / 2);
         assert!(
-            left.iter().zip(bar.clawd_accent.fill).all(|(a, b)| a.abs_diff(b) <= 12),
-            "行が無いと枠まで消えている: {left:?}"
-        );
-        // 下地はグラデーションなので一色ではないが、キャラも見出しも出ない
-        let r = l.rows[0];
-        assert!(
-            (r.x..r.x + r.w).all(|x| (r.y..r.y + r.h)
-                .all(|y| px(&empty, x, y).iter().all(|&v| v < 150))),
-            "行が無いのに中身が描かれている"
+            (l.panel.x..l.panel.x + l.panel.w)
+                .all(|x| (l.panel.y..l.panel.y + l.panel.h).all(|y| px(&empty, x, y) == BG)),
+            "行が無いのに何か描かれている"
         );
     }
 
@@ -1223,7 +1376,7 @@ mod tests {
 
     #[test]
     fn controls_sit_centred_and_inside_the_panel() {
-        let l = NpLayout::new(1366, 96, 24 + 592);
+        let l = NpLayout::new(1366, 96, MARGIN, 400);
         let (top, bottom) = (l.panel.y, l.panel.y + l.panel.h);
         for (i, &d) in l.btn_d.iter().enumerate() {
             assert!(l.btn_y[i] >= top, "ボタン {i} がパネルの上へ出ている");
@@ -1250,7 +1403,7 @@ mod tests {
         let want = PAD * 2 + 72 + GAP + 300 + GAP + 200;
         assert_eq!(panel_width(2000, 560, Some(300), 72, 200), want);
         // 実際にレイアウトへ通しても列②は 300px
-        let l = NpLayout::new(1366, 96, 24 + 592);
+        let l = NpLayout::new(1366, 96, MARGIN, 400);
         // 既定では列②はパネル幅の余り(定数から算出するので既定値を変えても追従する)
         let col3 = BTN_D_DEFAULT.iter().sum::<u32>() + BTN_GAP * 4;
         assert_eq!(l.col2_w, 400 - PAD * 2 - 72 - GAP - GAP - col3);
@@ -1264,12 +1417,13 @@ mod tests {
 
     #[test]
     fn panel_never_overlaps_the_icons() {
-        // アイコン列が伸びてパネルの取り分が減っても、右端を侵食せず幅だけ縮む
+        // 使える幅が減っても、右端を侵食せず幅だけ縮む
         // (env は他のテストと共有されるのでレイアウトを直接組んで確かめる)
-        for icons_right in [600u32, 900, 1200] {
-            let l = NpLayout::new(1366, 96, icons_right);
-            assert!(l.panel.x > icons_right, "icons_right={icons_right} で重なっている");
-            assert!(l.panel.x + l.panel.w <= 1366, "icons_right={icons_right} で画面外");
+        for avail in [160u32, 300, 800] {
+            let l = NpLayout::new(1366, 96, MARGIN, avail);
+            assert!(l.panel.w <= avail, "avail={avail} で使える幅を超えている");
+            assert_eq!(l.panel.x + l.panel.w, 1366 - MARGIN, "avail={avail} で右端がずれた");
+            assert!(l.panel.x + l.panel.w <= 1366, "avail={avail} で画面外");
             // 列②が潰れても他の列は成立したまま
             // ボタンと進捗バーはパネルの内側に収まる
             let panel_right = l.panel.x + l.panel.w;

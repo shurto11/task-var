@@ -16,9 +16,8 @@ pub struct IconDef {
     pub svg: &'static [u8],
 }
 
-pub const ICONS: [IconDef; 7] = [
+pub const ICONS: [IconDef; 6] = [
     IconDef { name: "tmux", session: None, svg: include_bytes!("../assets/tmux.svg") },
-    IconDef { name: "spotify", session: Some("spotify"), svg: include_bytes!("../assets/spotify.svg") },
     IconDef { name: "shorts", session: Some("shorts"), svg: include_bytes!("../assets/shorts.svg") },
     IconDef { name: "bluetooth", session: Some("bluetooth"), svg: include_bytes!("../assets/bluetooth.svg") },
     IconDef { name: "ssbrowse", session: Some("ssbrowse"), svg: include_bytes!("../assets/ssbrowse.svg") },
@@ -26,10 +25,16 @@ pub const ICONS: [IconDef; 7] = [
     IconDef { name: "calendar", session: Some("calendar"), svg: include_bytes!("../assets/calendar.svg") },
 ];
 
-/// Spotify パネルのボタン以外をタップしたときの遷移先。アイコンと同じ動作に
-/// するため定義そのものを引く(セッションが無ければ作ってから切り替わる)。
+/// Spotify は再生情報パネルが受け持つので、アイコン列には並べない
+/// (パネル自体が同じ大きさの押しどころになっている)。定義だけは残して、
+/// パネルのタップとアート未取得時のアイコンがこれを引く。
+pub const SPOTIFY: IconDef =
+    IconDef { name: "spotify", session: Some("spotify"), svg: include_bytes!("../assets/spotify.svg") };
+
+/// Spotify パネルのボタン以外をタップしたときの遷移先。
+/// セッションが無ければ作ってから切り替わる。
 pub fn spotify() -> &'static IconDef {
-    ICONS.iter().find(|d| d.name == "spotify").expect("spotify アイコンが定義にない")
+    &SPOTIFY
 }
 
 fn home() -> String {

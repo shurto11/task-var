@@ -104,18 +104,6 @@ impl Accent {
     fn from_hs(h: f32, s: f32) -> Self {
         Self { fill: from_hsl(h, s, FILL_L), edge: from_hsl(h, s, EDGE_L) }
     }
-
-    /// 手元にある 1 色から作る(clawd 枠がキャラのオレンジを敷くのに使う)。
-    /// アートのときと同じで、受け取るのは色相と彩度だけ。明度は固定なので、
-    /// 元の色がどれだけ明るくても白文字のコントラストは保たれる。
-    pub fn from_bgr(bgr: [u8; 3]) -> Self {
-        let (h, s, _) = to_hsl(bgr);
-        if s < 0.15 {
-            // 無彩色から色相を作っても意味がないので、既定と同じ扱いにする
-            return Self::from_hs(210.0, 0.06);
-        }
-        Self::from_hs(h, s.clamp(S_MIN, S_MAX))
-    }
 }
 
 /// アルバムアート(side*side*4 の BGRA)から代表色を選ぶ。
@@ -226,21 +214,6 @@ mod tests {
         let gray = accent(&solid([0x80, 0x80, 0x80]));
         let (_, s, _) = to_hsl(gray.fill);
         assert!(s < 0.2, "白黒のアートに色が付いている: {s}");
-    }
-
-    #[test]
-    fn from_bgr_keeps_the_hue_and_fixes_the_lightness() {
-        // clawd02.png のオレンジ(BGR)。色相は残り、明度は下地の値へ落ちる
-        let a = Accent::from_bgr([80, 108, 217]);
-        let (h, _, l) = to_hsl(a.fill);
-        let (src_h, _, src_l) = to_hsl([80, 108, 217]);
-        assert!((h - src_h).abs() < 2.0, "色相が変わっている: {h} vs {src_h}");
-        assert!(l < src_l, "元より暗くなっていない: {l} vs {src_l}");
-        assert!((l - FILL_L).abs() < 0.02, "下地の明度が固定されていない: {l}");
-        assert!(to_hsl(a.edge).2 > l, "枠線が下地より明るくない");
-
-        // 無彩色は既定と同じ冷たい灰色へ
-        assert_eq!(Accent::from_bgr([128, 128, 128]).fill, Accent::from_hs(210.0, 0.06).fill);
     }
 
     #[test]
