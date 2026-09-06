@@ -26,6 +26,12 @@ pub const ICONS: [IconDef; 7] = [
     IconDef { name: "calendar", session: Some("calendar"), svg: include_bytes!("../assets/calendar.svg") },
 ];
 
+/// Spotify パネルのボタン以外をタップしたときの遷移先。アイコンと同じ動作に
+/// するため定義そのものを引く(セッションが無ければ作ってから切り替わる)。
+pub fn spotify() -> &'static IconDef {
+    ICONS.iter().find(|d| d.name == "spotify").expect("spotify アイコンが定義にない")
+}
+
 fn home() -> String {
     std::env::var("HOME").unwrap_or_else(|_| "/root".to_string())
 }

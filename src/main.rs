@@ -357,6 +357,12 @@ fn main() -> Result<()> {
                             eprintln!("task-var: {} の起動に失敗: {e:#}", actions::ICONS[i].name);
                         }
                     }
+                    Some(Hit::Panel) => {
+                        let def = actions::spotify();
+                        if let Err(e) = actions::activate(def, &state) {
+                            eprintln!("task-var: {} の起動に失敗: {e:#}", def.name);
+                        }
+                    }
                     Some(Hit::Ctrl(c)) => {
                         if let Some(p) = np.player {
                             eprintln!("task-var: {c:?} を MPRIS へ送信");

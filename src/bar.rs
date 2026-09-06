@@ -306,6 +306,8 @@ pub struct NpView<'a> {
 pub enum Hit {
     Icon(usize),
     Ctrl(Ctrl),
+    /// パネル内のボタン以外。spotatui のセッションへ遷移する。
+    Panel,
 }
 
 pub struct Bar {
@@ -512,13 +514,17 @@ impl Bar {
     }
 
     /// バーローカル座標 (lx,ly) が何に当たるか。`np_shown` が false のときは
-    /// パネルを描いていないので操作ボタンの判定を飛ばす。
+    /// パネルを描いていないのでパネル関連の判定を飛ばす。
     pub fn hit(&self, lx: f64, ly: f64, np_shown: bool) -> Option<Hit> {
         if np_shown {
             for (i, ctrl) in CTRLS.iter().enumerate() {
                 if self.np.ctrl_slot(i).contains(lx, ly) {
                     return Some(Hit::Ctrl(*ctrl));
                 }
+            }
+            // ボタンに当たらなかったパネル内(アート・曲名・余白)は遷移。
+            if self.np.panel.contains(lx, ly) {
+                return Some(Hit::Panel);
             }
         }
         // 円の少し外までタッチを許容する。
@@ -764,6 +770,18 @@ mod tests {
             // パネル非表示中はボタン判定をしない
             assert_eq!(bar.hit(sx, sy, false), None, "非表示時のスロット {i}");
         }
+
+        // ボタン以外のパネル内(アート・曲名・左端の余白)は遷移扱い
+        let a = bar.np.art;
+        let art_c = ((a.x + a.w / 2) as f64, (a.y + a.h / 2) as f64);
+        assert_eq!(bar.hit(art_c.0, art_c.1, true), Some(Hit::Panel), "アルバムアート");
+        let p = bar.np.panel;
+        let text_y = (p.y + p.h / 2) as f64;
+        assert_eq!(bar.hit(bar.np.col2_x as f64 + 4.0, text_y, true), Some(Hit::Panel), "曲名");
+        assert_eq!(bar.hit((p.x + 2) as f64, text_y, true), Some(Hit::Panel), "パネル左端");
+        // パネルの外と、パネル非表示中は当たらない
+        assert_eq!(bar.hit((p.x - 4) as f64, text_y, true), None, "パネルの左外");
+        assert_eq!(bar.hit(art_c.0, art_c.1, false), None, "非表示時のアート");
 
         // TASKVAR_TEST_DUMP=path で目視確認用の PPM を書き出す。
         // トグルの ON/OFF でグリフと色が変わるので、両方の状態を出す
