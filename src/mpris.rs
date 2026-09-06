@@ -18,7 +18,7 @@ use crate::np::NowPlaying;
 use serde_json::Value;
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const DEST: &str = "org.mpris.MediaPlayer2.spotatui";
 const OBJ: &str = "/org/mpris/MediaPlayer2";
@@ -114,7 +114,7 @@ impl PlayerState {
 pub struct Pending {
     ctrl: Ctrl,
     want: PlayerState,
-    until: std::time::Instant,
+    until: Instant,
 }
 
 /// 保留を持てる時間。
@@ -122,12 +122,12 @@ const HOLD: Duration = Duration::from_secs(5);
 
 impl Pending {
     pub fn new(ctrl: Ctrl, want: PlayerState) -> Self {
-        Self { ctrl, want, until: std::time::Instant::now() + HOLD }
+        Self { ctrl, want, until: Instant::now() + HOLD }
     }
 
     /// ポーリング結果 `got` に保留値をかぶせる。反映済み/期限切れなら false を
     /// 返す(呼び出し側が保留を捨てる)。
-    pub fn overlay(&self, got: &mut PlayerState, now: std::time::Instant) -> bool {
+    pub fn overlay(&self, got: &mut PlayerState, now: Instant) -> bool {
         if got.reflects(self.ctrl, &self.want) || now >= self.until {
             return false;
         }
@@ -278,37 +278,76 @@ pub fn activate(ctrl: Ctrl, cur: PlayerState) {
 
 /// ポーリング間隔。
 const POLL_EVERY: Duration = Duration::from_secs(1);
-/// Position がこれ以上進んでいれば再生中とみなす(ポーリング間隔に対する余裕)。
+/// Position がこれ以上進んでいれば「動いた」とみなす。
 const POS_EPSILON_MS: u64 = 200;
+/// 動かない状態がこれだけ続いて初めて停止とみなす。
+///
+/// spotatui の Position は **1 秒刻みでしか動かず、しかも ±250ms ほど前後する**
+/// (実機で 0.4 秒間隔に採って確認した)。ポーリングも 1 秒間隔なので、位相が
+/// 重なると再生中でも差が 0 になる回が現れる。1 回ぶんで停止と判定すると、
+/// そこだけ再生ボタンの表示が入れ替わってすぐ戻る。刻み 2 回ぶんは待つ。
+const STALL_FOR: Duration = Duration::from_millis(2500);
+/// これ以上戻っていたらシークか 1 曲リピートの頭出し。止まってはいないので
+/// 基準を取り直して再生中のままにする。
+const REWIND_MS: u64 = 1000;
 
-/// PlaybackStatus を Position の進み具合で上書き判定する。
+/// Position の進み具合から再生中かを判定するための基準点。
+///
 /// spotatui の PlaybackStatus は、librespot が非アクティブなデバイスを掴んで
 /// いると実際の再生と食い違う(実機で Position は進むのに Stopped のままになる
-/// のを確認した)。曲が変わった直後など比較できないときは None。
-fn playing_by_position(prev: &Option<(String, u64)>, np: &NowPlaying) -> Option<bool> {
-    let (track, pos) = prev.as_ref()?;
-    (*track == np.track).then(|| np.progress_ms > pos + POS_EPSILON_MS)
+/// のを確認した)ため、Position の方を正とする。
+#[derive(Debug)]
+struct PosWatch {
+    track: String,
+    /// 最後に「動いた」と認めたときの Position。
+    pos: u64,
+    /// そのときの時刻。
+    moved: Instant,
+}
+
+impl PosWatch {
+    /// 新しいサンプルを与えて、再生中かどうかを返す。
+    /// 曲が変わった直後など比較できないときは None(呼び出し側は
+    /// PlaybackStatus をそのまま使う)。
+    fn update(cur: &mut Option<Self>, np: &NowPlaying, now: Instant) -> Option<bool> {
+        match cur {
+            Some(w) if w.track == np.track => {
+                let pos = np.progress_ms;
+                if pos > w.pos + POS_EPSILON_MS || pos + REWIND_MS < w.pos {
+                    // 進んだ / 巻き戻った。どちらも動いている証拠
+                    w.pos = pos;
+                    w.moved = now;
+                    Some(true)
+                } else {
+                    // 1 秒刻みの谷間か、実際に止まっているか。
+                    // 動かないまま STALL_FOR を過ぎたら停止と決める
+                    Some(now.duration_since(w.moved) < STALL_FOR)
+                }
+            }
+            _ => {
+                *cur = Some(Self { track: np.track.clone(), pos: np.progress_ms, moved: now });
+                None
+            }
+        }
+    }
 }
 
 /// 1 秒間隔で状態をポーリングするスレッドを起動する(detached)。
 pub fn spawn(shared: Arc<Mutex<Option<Snapshot>>>) {
     std::thread::spawn(move || {
-        let mut prev: Option<(String, u64)> = None;
+        let mut watch: Option<PosWatch> = None;
         loop {
             let mut snap = poll();
-            prev = match snap.as_mut() {
-                Some(s) => match s.np.as_mut() {
-                    Some(np) => {
-                        if let Some(playing) = playing_by_position(&prev, np) {
-                            s.player.playing = playing;
-                            np.is_playing = playing; // 進捗の補間もこれに従う
-                        }
-                        Some((np.track.clone(), np.progress_ms))
+            match snap.as_mut().and_then(|s| s.np.as_mut().map(|np| (&mut s.player, np))) {
+                Some((player, np)) => {
+                    if let Some(playing) = PosWatch::update(&mut watch, np, Instant::now()) {
+                        player.playing = playing;
+                        np.is_playing = playing; // 進捗の補間もこれに従う
                     }
-                    None => None,
-                },
-                None => None,
-            };
+                }
+                // 曲が取れないなら基準も捨てる(次に来た曲で取り直す)
+                None => watch = None,
+            }
             *shared.lock().unwrap() = snap;
             std::thread::sleep(POLL_EVERY);
         }
@@ -356,25 +395,37 @@ mod tests {
 
     #[test]
     fn playing_follows_the_position_not_the_status() {
-        let mut np = NowPlaying {
-            track: "HOP".into(),
+        let np_at = |track: &str, ms: u64| NowPlaying {
+            track: track.into(),
             artist: "a".into(),
             art_url: None,
-            progress_ms: 5_000,
+            progress_ms: ms,
             duration_ms: 100_000,
             written_at_ms: 0,
             is_playing: false,
         };
-        // 同じ曲で Position が進んでいれば再生中
-        let prev = Some(("HOP".to_string(), 4_000u64));
-        assert_eq!(playing_by_position(&prev, &np), Some(true));
-        // 止まっていれば停止中(PlaybackStatus が Playing でもこちらを採る)
-        np.progress_ms = 4_100; // 誤差の範囲
-        assert_eq!(playing_by_position(&prev, &np), Some(false));
-        // 曲が変わった直後と初回は判定できない
-        np.track = "LOCO".into();
-        assert_eq!(playing_by_position(&prev, &np), None);
-        assert_eq!(playing_by_position(&None, &np), None);
+        let t0 = Instant::now();
+        let at = |sec: u64| t0 + Duration::from_secs(sec);
+        let mut w = None;
+
+        // 初回は基準が無いので判定できない
+        assert_eq!(PosWatch::update(&mut w, &np_at("HOP", 5_000), t0), None);
+        // 進んでいれば再生中(PlaybackStatus が Stopped でもこちらを採る)
+        assert_eq!(PosWatch::update(&mut w, &np_at("HOP", 6_000), at(1)), Some(true));
+        // Position は 1 秒刻みなので、同じ値が返る回がある。ここで止めない
+        assert_eq!(PosWatch::update(&mut w, &np_at("HOP", 6_000), at(2)), Some(true));
+        // 250ms ほど後戻りするのも実機では普通(これも止めない)
+        assert_eq!(PosWatch::update(&mut w, &np_at("HOP", 5_750), at(3)), Some(true));
+        // 動かないまま STALL_FOR を過ぎたら停止
+        assert_eq!(PosWatch::update(&mut w, &np_at("HOP", 6_000), at(4)), Some(false));
+        // また進めば再生中へ戻る
+        assert_eq!(PosWatch::update(&mut w, &np_at("HOP", 7_000), at(5)), Some(true));
+        // 頭出し(1 曲リピート)は「動いた」扱い。止まってはいない
+        assert_eq!(PosWatch::update(&mut w, &np_at("HOP", 300), at(6)), Some(true));
+
+        // 曲が変わった直後は基準を取り直すので判定できない
+        assert_eq!(PosWatch::update(&mut w, &np_at("LOCO", 1_000), at(7)), None);
+        assert_eq!(PosWatch::update(&mut w, &np_at("LOCO", 2_000), at(8)), Some(true));
     }
 
     #[test]
