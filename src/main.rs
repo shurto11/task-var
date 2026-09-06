@@ -73,8 +73,8 @@ fn env_u32(name: &str, default: u32) -> u32 {
 struct Np {
     now: Option<NowPlaying>,
     player: Option<PlayerState>,
-    /// 取得済みのアルバムアート(URL と BGRA)。
-    art: Option<(String, Vec<u8>)>,
+    /// 取得済みのアルバムアート(URL・BGRA・そこから採った背景色)。
+    art: Option<(String, Vec<u8>, art::Accent)>,
     /// ボタンを押した直後の期待値。ポーリングが追いつくまで表示に反映する。
     pending: Option<Pending>,
 }
@@ -101,8 +101,10 @@ impl Np {
         if let Some(url) = self.now.as_ref().and_then(|n| n.art_url.as_deref()) {
             art.request(url);
         }
-        if let Some(got) = art.take() {
-            self.art = Some(got);
+        if let Some((url, bgra)) = art.take() {
+            // 代表色の抽出は取得時の 1 回だけ。毎フレームやる必要はない。
+            let accent = art::accent(&bgra);
+            self.art = Some((url, bgra, accent));
         }
     }
 
@@ -111,13 +113,15 @@ impl Np {
     fn view(&self) -> Option<NpView<'_>> {
         let now = self.now.as_ref()?;
         let player = self.player?;
-        // アートは今の曲のものだけ使う(曲送り直後の取り違えを防ぐ)
-        let art = self
+        // アートは今の曲のものだけ使う(曲送り直後の取り違えを防ぐ)。
+        // 背景色も同じアート由来なので、外れたときは既定色へ一緒に戻す。
+        let album = self
             .art
             .as_ref()
-            .filter(|(url, _)| Some(url.as_str()) == now.art_url.as_deref())
-            .map(|(_, bgra)| bgra.as_slice());
-        Some(NpView { np: now, player, art })
+            .filter(|(url, _, _)| Some(url.as_str()) == now.art_url.as_deref());
+        let art = album.map(|(_, bgra, _)| bgra.as_slice());
+        let accent = album.map(|(_, _, a)| *a).unwrap_or_default();
+        Some(NpView { np: now, player, art, accent })
     }
 
     /// 再生中かどうか(短周期で回して進捗バーを動かすかの判断に使う)。

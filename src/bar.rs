@@ -13,6 +13,7 @@
 //! 取れず、曲名が数文字で切れてしまうため。
 
 use crate::actions::{IconDef, ICONS};
+use crate::art::Accent;
 use crate::icons::{self, Glyph};
 use crate::mpris::{Ctrl, Loop, PlayerState};
 use crate::np::NowPlaying;
@@ -35,11 +36,7 @@ const GREEN: [u8; 3] = [0x60, 0xD7, 0x1E]; // #1ED760 アクセント
 const SUB_TEXT: [u8; 3] = [0xB3, 0xB3, 0xB3]; // #B3B3B3 アーティスト名
 const GROOVE: [u8; 3] = [0x53, 0x53, 0x53]; // #535353 進捗バーの溝
 const ART_BG: [u8; 3] = [0x28, 0x28, 0x28]; // アート未取得時の下地
-// 背景のグラデーション。左端の暗いグリーンから右の #121212 へ落とす。
-// アクセントの #1ED760 をそのまま敷くと白文字が読めないので、暗く落とした
-// 同系色を使う(白とのコントラスト比は約 8:1)。
-const GRAD_GREEN: [u8; 3] = [0x28, 0x5A, 0x0C]; // #0C5A28
-const GRAD_EDGE: [u8; 3] = [0x45, 0x8A, 0x1A]; // #1A8A45 枠線の左端
+// 背景のグラデーション。左端の色はアルバムアートから採る(art::Accent)。
 /// グラデーションが単色へ落ち着くまでの横幅(パネル幅に対する割合)。
 /// ボタン列(左から約 60%)より手前で落とし切り、白いグリフを素の暗色に乗せる。
 const GRAD_SPREAD: f32 = 0.65;
@@ -299,6 +296,8 @@ pub struct NpView<'a> {
     pub player: PlayerState,
     /// アルバムアート(art 一辺の正方形・BGRA)。未取得なら None。
     pub art: Option<&'a [u8]>,
+    /// 背景グラデーションの起点色。アートから採る。未取得なら Spotify グリーン。
+    pub accent: Accent,
 }
 
 /// タップが当たった対象。
@@ -429,10 +428,10 @@ impl Bar {
     fn draw_np(&self, buf: &mut [u8], view: &NpView) {
         let l = &self.np;
         // パネル: 枠線の角丸矩形の内側を 1px 詰めて塗る
-        round_rect_grad(buf, self.w, self.h, l.panel, 10.0, GRAD_EDGE, PANEL_EDGE);
+        round_rect_grad(buf, self.w, self.h, l.panel, 10.0, view.accent.edge, PANEL_EDGE);
         let inner =
             Rect { x: l.panel.x + 1, y: l.panel.y + 1, w: l.panel.w - 2, h: l.panel.h - 2 };
-        round_rect_grad(buf, self.w, self.h, inner, 9.0, GRAD_GREEN, PANEL);
+        round_rect_grad(buf, self.w, self.h, inner, 9.0, view.accent.fill, PANEL);
 
         // 列①: アルバムアート(角は 6px の丸め。パネル色へブレンドして落とす)
         match view.art {
@@ -714,6 +713,16 @@ mod tests {
         assert_eq!(ring_color(&ICONS[0], &st2), Some(BLUE), "通常セッション表示中のtmuxは青");
     }
 
+    /// `TASKVAR_TEST_ART` が指す画像を side x side の BGRA にして返す。
+    fn test_art(side: u32) -> Option<Vec<u8>> {
+        let path = std::env::var("TASKVAR_TEST_ART").ok()?;
+        let img = image::open(&path)
+            .unwrap_or_else(|e| panic!("{path} を開けない: {e}"))
+            .resize_exact(side, side, image::imageops::FilterType::Lanczos3)
+            .to_rgba8();
+        Some(img.pixels().flat_map(|p| [p.0[2], p.0[1], p.0[0], 0]).collect())
+    }
+
     #[test]
     fn draw_and_hit() {
         // 実機と同じ 1366x96(fbterm のセル高 16px にスナップされた値)
@@ -722,10 +731,14 @@ mod tests {
         let mut buf = vec![0u8; (w * h * 4) as usize];
         let st = state("spotify", &["spotify"]);
         let np = now_playing();
+        // TASKVAR_TEST_ART=画像パス で実際のジャケットを流し込める
+        // (アートから採る背景色を目視で確かめるため)。
+        let art = test_art(bar.art_side());
         let view = NpView {
             np: &np,
             player: PlayerState { playing: true, shuffle: true, repeat: Loop::Playlist },
-            art: None,
+            art: art.as_deref(),
+            accent: art.as_deref().map(crate::art::accent).unwrap_or_default(),
         };
         bar.draw(&mut buf, &st, Some(&view));
 
@@ -748,9 +761,14 @@ mod tests {
         // パネルは黒ではなく Spotify のパネル色で塗られている
         let p = bar.np_rect();
         assert!(p.x > icons_right, "パネルはアイコン列より右");
-        // 背景は左のグリーンから右の素の暗色へ落ちる
+        // 背景は左端が accent(既定は Spotify グリーン、アートがあればその色)、
+        // 右端が素の暗色。左端はまだ落ち始めたばかりなので accent とほぼ一致する。
         let left = px(&buf, p.x + 4, p.y + p.h / 2);
-        assert!(left[1] > left[2] + 24, "左端がグリーンに寄っていない: {left:?}");
+        assert!(
+            left.iter().zip(view.accent.fill).all(|(a, b)| a.abs_diff(b) <= 12),
+            "左端が accent の色になっていない: {left:?} vs {:?}",
+            view.accent.fill
+        );
         assert_eq!(px(&buf, p.x + p.w - 4, p.y + p.h / 2), PANEL, "右端は素のパネル色");
 
         // 進捗バー: 塗り部分は緑、末尾側は溝の色
@@ -799,7 +817,8 @@ mod tests {
             let off = NpView {
                 np: &np,
                 player: PlayerState { playing: false, shuffle: false, repeat: Loop::Track },
-                art: None,
+                art: art.as_deref(),
+                accent: art.as_deref().map(crate::art::accent).unwrap_or_default(),
             };
             bar.draw(&mut buf, &st, Some(&off));
             dump(&buf, &format!("{path}.off"));
