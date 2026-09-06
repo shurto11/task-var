@@ -515,17 +515,21 @@ impl Bar {
         for (i, def) in ICONS.iter().enumerate() {
             self.draw_tile(buf, self.xs[i], ring_color(def, state), &self.glyphs[i]);
         }
-        if let Some(view) = np {
-            self.draw_np(buf, view);
+        match np {
+            Some(view) => self.draw_np(buf, view),
+            // spotatui が居なくても枠だけは残す。場所が動かないので、
+            // 起動していないことが一目で分かるうえタップ先もずれない。
+            None => self.draw_np_idle(buf),
         }
-        if let Some(view) = clawd.filter(|v| !v.rows.is_empty()) {
+        if let Some(view) = clawd {
             self.draw_clawd(buf, view);
         }
     }
 
-    /// clawd 枠を描く。行が 1 つも無いときは呼ばない(枠ごと消える)。
+    /// clawd 枠を描く。行が 1 つも無くても枠だけは描く
+    /// (claude が動いていない間もバーの形を変えないため)。
     fn draw_clawd(&self, buf: &mut [u8], view: &ClawdView) {
-        let (Some(l), Some(sprite)) = (&self.clawd, &self.sprite) else { return };
+        let Some(l) = &self.clawd else { return };
 
         // 枠は再生情報パネルと同じ作り: 左端からパネル幅の 65% までで #121212 へ
         // 落とす斜めのグラデーション。起点の色は**キャラのオレンジから採る**
@@ -535,6 +539,9 @@ impl Bar {
         let inner =
             Rect { x: l.panel.x + 1, y: l.panel.y + 1, w: l.panel.w - 2, h: l.panel.h - 2 };
         round_rect_grad(buf, self.w, self.h, inner, 9.0, self.clawd_accent.fill, PANEL);
+
+        // キャラの画像が読めなかったときは枠だけで止める(行は出せない)。
+        let Some(sprite) = &self.sprite else { return };
 
         for (row, r) in view.rows.iter().zip(l.rows.iter()) {
             let body = match row.st {
@@ -601,31 +608,41 @@ impl Bar {
         premul_glyph(buf, self.w, x0 + (d - glyph.px) / 2, self.tile_y + (d - glyph.px) / 2, glyph);
     }
 
+    /// パネルの下地。枠線の角丸矩形の内側を 1px 詰めて塗る。
+    fn draw_np_bg(&self, buf: &mut [u8], accent: Accent) {
+        let p = self.np.panel;
+        round_rect_grad(buf, self.w, self.h, p, 10.0, accent.edge, PANEL_EDGE);
+        let inner = Rect { x: p.x + 1, y: p.y + 1, w: p.w - 2, h: p.h - 2 };
+        round_rect_grad(buf, self.w, self.h, inner, 9.0, accent.fill, PANEL);
+    }
+
+    /// 列①のアート未取得時の代わり。下地の上に Spotify のアイコンを置く。
+    fn draw_art_placeholder(&self, buf: &mut [u8]) {
+        let a = self.np.art;
+        round_rect(buf, self.w, self.h, a, 6.0, ART_BG);
+        let g = &self.art_fallback;
+        premul_glyph(buf, self.w, a.x + (a.w - g.px) / 2, a.y + (a.h - g.px) / 2, g);
+    }
+
+    /// spotatui が居ないときのパネル。枠と、アルバムアートの場所に置いた
+    /// Spotify のアイコンだけ(曲名・ボタン・進捗バーは出さない)。
+    /// 背景の起点色はアートが無いときと同じ Spotify グリーン。
+    fn draw_np_idle(&self, buf: &mut [u8]) {
+        self.draw_np_bg(buf, Accent::default());
+        self.draw_art_placeholder(buf);
+    }
+
     /// 再生情報パネルを描く。
     fn draw_np(&self, buf: &mut [u8], view: &NpView) {
         let l = &self.np;
-        // パネル: 枠線の角丸矩形の内側を 1px 詰めて塗る
-        round_rect_grad(buf, self.w, self.h, l.panel, 10.0, view.accent.edge, PANEL_EDGE);
-        let inner =
-            Rect { x: l.panel.x + 1, y: l.panel.y + 1, w: l.panel.w - 2, h: l.panel.h - 2 };
-        round_rect_grad(buf, self.w, self.h, inner, 9.0, view.accent.fill, PANEL);
+        self.draw_np_bg(buf, view.accent);
 
         // 列①: アルバムアート(角は 6px の丸め。パネル色へブレンドして落とす)
         match view.art {
             Some(bgra) if bgra.len() >= (l.art.w * l.art.h * 4) as usize => {
                 blit_round(buf, self.w, self.h, l.art, bgra, 6.0);
             }
-            _ => {
-                round_rect(buf, self.w, self.h, l.art, 6.0, ART_BG);
-                let g = &self.art_fallback;
-                premul_glyph(
-                    buf,
-                    self.w,
-                    l.art.x + (l.art.w - g.px) / 2,
-                    l.art.y + (l.art.h - g.px) / 2,
-                    g,
-                );
-            }
+            _ => self.draw_art_placeholder(buf),
         }
 
         // 列②: 曲名 / アーティスト名
@@ -689,10 +706,11 @@ impl Bar {
         tint_glyph(buf, self.w, self.h, x + off, y + off, g, color);
     }
 
-    /// バーローカル座標 (lx,ly) が何に当たるか。`np_shown` が false のときは
-    /// パネルを描いていないのでパネル関連の判定を飛ばす。`clawd_rows` は
+    /// バーローカル座標 (lx,ly) が何に当たるか。`ctrls_shown` が false のときは
+    /// 操作ボタンを描いていない(spotatui が居ない)ので、パネル内はどこを
+    /// 押しても遷移になる。`clawd_rows` は
     /// いま描いている clawd の行数(描いていない行は当たらない)。
-    pub fn hit(&self, lx: f64, ly: f64, np_shown: bool, clawd_rows: usize) -> Option<Hit> {
+    pub fn hit(&self, lx: f64, ly: f64, ctrls_shown: bool, clawd_rows: usize) -> Option<Hit> {
         if let Some(l) = &self.clawd {
             for (i, r) in l.rows.iter().take(clawd_rows).enumerate() {
                 if r.contains(lx, ly) {
@@ -700,16 +718,17 @@ impl Bar {
                 }
             }
         }
-        if np_shown {
+        if ctrls_shown {
             for (i, ctrl) in CTRLS.iter().enumerate() {
                 if self.np.ctrl_slot(i).contains(lx, ly) {
                     return Some(Hit::Ctrl(*ctrl));
                 }
             }
-            // ボタンに当たらなかったパネル内(アート・曲名・余白)は遷移。
-            if self.np.panel.contains(lx, ly) {
-                return Some(Hit::Panel);
-            }
+        }
+        // ボタンに当たらなかったパネル内(アート・曲名・余白)は遷移。
+        // 枠だけの状態でも同じで、押せば spotatui のセッションが立ち上がる。
+        if self.np.panel.contains(lx, ly) {
+            return Some(Hit::Panel);
         }
         // 円の少し外までタッチを許容する。
         let r = self.circle_d as f64 / 2.0 + 8.0;
@@ -986,8 +1005,8 @@ mod tests {
             let s = bar.np.ctrl_slot(i);
             let (sx, sy) = ((s.x + s.w / 2) as f64, (s.y + s.h / 2) as f64);
             assert_eq!(bar.hit(sx, sy, true, 0), Some(Hit::Ctrl(*ctrl)), "スロット {i}");
-            // パネル非表示中はボタン判定をしない
-            assert_eq!(bar.hit(sx, sy, false, 0), None, "非表示時のスロット {i}");
+            // ボタンを描いていないときは、同じ場所でも遷移扱いになる
+            assert_eq!(bar.hit(sx, sy, false, 0), Some(Hit::Panel), "枠だけのスロット {i}");
         }
 
         // ボタン以外のパネル内(アート・曲名・左端の余白)は遷移扱い
@@ -998,9 +1017,9 @@ mod tests {
         let text_y = (p.y + p.h / 2) as f64;
         assert_eq!(bar.hit(bar.np.col2_x as f64 + 4.0, text_y, true, 0), Some(Hit::Panel), "曲名");
         assert_eq!(bar.hit((p.x + 2) as f64, text_y, true, 0), Some(Hit::Panel), "パネル左端");
-        // パネルの外と、パネル非表示中は当たらない
+        // パネルの外は当たらない。枠だけの状態でもパネル内は遷移のまま
         assert_eq!(bar.hit((p.x - 4) as f64, text_y, true, 0), None, "パネルの左外");
-        assert_eq!(bar.hit(art_c.0, art_c.1, false, 0), None, "非表示時のアート");
+        assert_eq!(bar.hit(art_c.0, art_c.1, false, 0), Some(Hit::Panel), "枠だけのアート");
 
         // TASKVAR_TEST_DUMP=path で目視確認用の PPM を書き出す。
         // トグルの ON/OFF でグリフと色が変わるので、両方の状態を出す
@@ -1039,14 +1058,51 @@ mod tests {
     }
 
     #[test]
-    fn panel_is_omitted_without_now_playing() {
+    fn empty_panel_keeps_the_frame_and_the_spotify_icon() {
         let (w, h) = (1366u32, 96u32);
         let bar = Bar::new(w, h).unwrap();
         let mut buf = vec![0u8; (w * h * 4) as usize];
         bar.draw(&mut buf, &state("spotify", &["spotify"]), None, None);
+        let px = |x: u32, y: u32| -> [u8; 3] {
+            let off = ((y * w + x) * 4) as usize;
+            [buf[off], buf[off + 1], buf[off + 2]]
+        };
         let p = bar.np_rect();
-        let off = (((p.y + 2) * w + p.x + p.w / 2) * 4) as usize;
-        assert_eq!([buf[off], buf[off + 1], buf[off + 2]], BG, "パネル無しなら黒のまま");
+
+        // 枠は出る。左端は既定 accent(Spotify グリーン)、右端は素のパネル色
+        let left = px(p.x + 3, p.y + p.h / 2);
+        let want = Accent::default().fill;
+        assert!(
+            left.iter().zip(want).all(|(a, b)| a.abs_diff(b) <= 12),
+            "左端が既定 accent になっていない: {left:?} vs {want:?}"
+        );
+        assert_eq!(px(p.x + p.w - 6, p.y + p.h - 4), PANEL, "右端がパネル色に落ちていない");
+
+        // アルバムアートの場所には Spotify のアイコン(下地でないピクセルがある)
+        let a = bar.art_side();
+        let art = bar.np.art;
+        assert_eq!(a, art.w);
+        assert!(
+            (art.x..art.x + art.w).any(|x| (art.y..art.y + art.h).any(|y| px(x, y) != ART_BG)),
+            "アルバム画像の場所にアイコンが描かれていない"
+        );
+
+        // 曲名の列とボタンの場所は空。下地はグラデーションなので一色ではないが、
+        // 文字やグリフのような明るいピクセルは 1 つも無い。
+        let l = &bar.np;
+        let dark = |x: u32, y: u32| px(x, y).iter().all(|&v| v < 150);
+        assert!(
+            (l.col2_x..l.col2_x + l.col2_w).all(|x| (p.y + 4..p.y + p.h - 4).all(|y| dark(x, y))),
+            "枠だけのはずが曲名の列に何か描かれている"
+        );
+        let btn = l.btn_xs[2] + l.btn_d[2] / 2;
+        assert_eq!(px(btn, l.btn_y[2] + l.btn_d[2] / 2), PANEL, "ボタンが描かれている");
+        let prog = l.prog;
+        assert_ne!(px(prog.x + 2, prog.y + prog.h / 2), GREEN, "進捗バーが描かれている");
+
+        // ボタンが無くても、パネルを押せば spotatui へ遷移する
+        let (cx, cy) = ((p.x + p.w / 2) as f64, (p.y + p.h / 2) as f64);
+        assert_eq!(bar.hit(cx, cy, false, 0), Some(Hit::Panel));
     }
 
     #[test]
@@ -1132,10 +1188,21 @@ mod tests {
         assert_eq!(bar.hit(x2, y2, false, rows.len()), None, "描いていない行は当たらない");
         assert_eq!(bar.hit(x0, y0, false, 0), None, "枠が空なら当たらない");
 
-        // 行が無いときは枠ごと出さない(バー背景のまま)
+        // 行が無くても枠だけは残る(キャラも見出しも出ない)
         let mut empty = vec![0u8; (w * h * 4) as usize];
         bar.draw(&mut empty, &st, None, Some(&ClawdView { rows: &[], phase: false }));
-        assert_eq!(px(&empty, l.panel.x + l.panel.w / 2, l.panel.y + l.panel.h / 2), BG);
+        let left = px(&empty, l.panel.x + 3, l.panel.y + l.panel.h / 2);
+        assert!(
+            left.iter().zip(bar.clawd_accent.fill).all(|(a, b)| a.abs_diff(b) <= 12),
+            "行が無いと枠まで消えている: {left:?}"
+        );
+        // 下地はグラデーションなので一色ではないが、キャラも見出しも出ない
+        let r = l.rows[0];
+        assert!(
+            (r.x..r.x + r.w).all(|x| (r.y..r.y + r.h)
+                .all(|y| px(&empty, x, y).iter().all(|&v| v < 150))),
+            "行が無いのに中身が描かれている"
+        );
     }
 
     #[test]

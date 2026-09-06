@@ -136,7 +136,11 @@ impl Np {
     }
 }
 
-/// バー全体を描き直し、(パネルを描いたか, clawd 枠に描いた行) を返す。
+/// バー全体を描き直し、(操作ボタンを描いたか, clawd 枠に描いた行) を返す。
+///
+/// spotatui が居なくてもパネルの枠は出る(中身が Spotify アイコンだけになる)。
+/// 返す bool は「曲情報と操作ボタンまで描いたか」で、当たり判定と
+/// 進捗バーの部分ブリットの判断に使う。
 ///
 /// 行は当たり判定と部分ブリットの判断にも要るので、描いたものをそのまま返す。
 fn redraw(
@@ -239,7 +243,7 @@ fn daemon() -> Result<()> {
     clawd::spawn(clawd_model.clone());
     // 走りアニメーションの位相の基準時刻。
     let started = Instant::now();
-    let (mut np_shown, mut rows) =
+    let (mut ctrls_shown, mut rows) =
         redraw(&bar, &mut buf, &state, &np, &clawd_model, clawd_phase(started));
 
     // touch-server クライアント起動。バー表示中は帯全体、非表示中は下端だけを
@@ -371,7 +375,7 @@ fn daemon() -> Result<()> {
             Duration::from_millis(bar::CLAWD_BOB_MS as u64 / 2)
         } else if bar_shown && swipe_mode {
             Duration::from_millis(200)
-        } else if bar_shown && np_shown && np.is_playing() {
+        } else if bar_shown && ctrls_shown && np.is_playing() {
             Duration::from_millis(500)
         } else {
             Duration::from_secs(1)
@@ -389,7 +393,7 @@ fn daemon() -> Result<()> {
                     if swiped_up {
                         state = tmux::State::poll();
                         np.refresh(&art, &player_shared);
-                        (np_shown, rows) =
+                        (ctrls_shown, rows) =
                             redraw(&bar, &mut buf, &state, &np, &clawd_model, clawd_phase(started));
                         show_bar(&fb, &buf)?;
                         bar_shown = true;
@@ -410,7 +414,7 @@ fn daemon() -> Result<()> {
                 }
                 let lx = up.fx1 * screen_w as f64;
                 let ly = up.fy1 * screen_h as f64 - bar_y as f64;
-                match bar.hit(lx, ly, np_shown, rows.len()) {
+                match bar.hit(lx, ly, ctrls_shown, rows.len()) {
                     Some(Hit::Icon(i)) => {
                         if let Err(e) = actions::activate(&actions::ICONS[i], &state) {
                             eprintln!("task-var: {} の起動に失敗: {e:#}", actions::ICONS[i].name);
@@ -453,7 +457,7 @@ fn daemon() -> Result<()> {
                 }
                 // タップ直後は状態が変わっているはずなので即時更新
                 state = tmux::State::poll();
-                (np_shown, rows) =
+                (ctrls_shown, rows) =
                     redraw(&bar, &mut buf, &state, &np, &clawd_model, clawd_phase(started));
                 if bar_shown {
                     fb.blit(0, bar_y, screen_w, bar_h, &buf)?;
@@ -501,7 +505,7 @@ fn daemon() -> Result<()> {
                 }
                 // 再生情報は毎ティック取り込んで描き直す(進捗バーを進めるため)。
                 np.refresh(&art, &player_shared);
-                (np_shown, rows) =
+                (ctrls_shown, rows) =
                     redraw(&bar, &mut buf, &state, &np, &clawd_model, clawd_phase(started));
 
                 if bar_shown {
@@ -512,7 +516,7 @@ fn daemon() -> Result<()> {
                         fb.blit(0, bar_y, screen_w, bar_h, &buf)?;
                         last_full = Instant::now();
                     } else {
-                        if np_shown {
+                        if ctrls_shown {
                             let r = bar.np_rect();
                             fb.blit(r.x, bar_y + r.y, r.w, r.h, &sub_rect(&buf, screen_w, r))?;
                         }
