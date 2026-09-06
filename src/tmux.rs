@@ -102,3 +102,60 @@ pub fn new_session(name: &str, cmd: &str) -> Result<()> {
 pub fn new_window(session: &str, cmd: &str) -> Result<()> {
     run_checked(&["new-window", "-t", &format!("{session}:"), cmd])
 }
+
+/// ペインの見出しに使う材料。`title` は端末タイトル(Claude Code が
+/// 「いま何をしているか」を書き込んでくる)、`cwd` はカレントディレクトリ。
+pub struct PaneInfo {
+    pub id: String,
+    pub title: String,
+    pub cwd: String,
+}
+
+/// 出力 1 行を PaneInfo にする。タイトルに空白が入るのでタブ区切りで受ける。
+fn parse_pane(line: &str) -> Option<PaneInfo> {
+    let mut f = line.splitn(3, '\t');
+    let id = f.next()?.trim();
+    if id.is_empty() {
+        return None;
+    }
+    Some(PaneInfo {
+        id: id.to_string(),
+        title: f.next().unwrap_or_default().trim().to_string(),
+        cwd: f.next().unwrap_or_default().trim().to_string(),
+    })
+}
+
+const PANE_FORMAT: &str = "#{pane_id}\t#{pane_title}\t#{pane_current_path}";
+
+/// 1 つのペインの情報。ペインが無ければ None。
+pub fn pane_info(pane: &str) -> Option<PaneInfo> {
+    parse_pane(run(&["display", "-p", "-t", pane, PANE_FORMAT])?.lines().next()?)
+}
+
+/// 全ペインの情報。tmux を呼べなければ None。
+pub fn panes() -> Option<Vec<PaneInfo>> {
+    Some(run(&["list-panes", "-a", "-F", PANE_FORMAT])?.lines().filter_map(parse_pane).collect())
+}
+
+/// tmux サーバーが動いているか。ペイン一覧の取得に失敗したとき、
+/// 「サーバーが居ない」のか「一時的な失敗」なのかを分けるために使う。
+pub fn server_running() -> bool {
+    Command::new("tmux")
+        .args(["has-session"])
+        .output()
+        .map(|o| {
+            let err = String::from_utf8_lossy(&o.stderr);
+            // セッションが 1 つも無いだけならサーバーは生きている
+            !err.contains("no server running") && !err.contains("error connecting")
+        })
+        .unwrap_or(false)
+}
+
+/// 表示中の tmux クライアントを、指定ペインのセッション・ウィンドウ・ペインへ
+/// 移す。デーモンは tmux クライアントの外に居るので、switch-client には
+/// 対象クライアントを明示する(`-t` にはペイン ID をそのまま渡せる)。
+pub fn goto_pane(client: &str, pane: &str) -> Result<()> {
+    run_checked(&["switch-client", "-c", client, "-t", pane])?;
+    run_checked(&["select-window", "-t", pane])?;
+    run_checked(&["select-pane", "-t", pane])
+}

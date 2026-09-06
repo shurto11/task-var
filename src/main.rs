@@ -5,6 +5,9 @@
 //! - 右側に Spotify の再生情報パネル(アルバムアート・曲名・アーティスト・
 //!   操作ボタン 5 個・進捗バー)を表示する。表示データは spotatui が書く
 //!   `/tmp/spotatui_np.json`、操作とシャッフル/リピート状態は MPRIS。
+//! - その間の枠に、動いている Claude Code をキャラクター + tmux セッション名で
+//!   最大 4 行並べる(旧 touch-claude)。状態は Claude Code の hooks が
+//!   `task-var hook-*` 経由で Unix ソケットへ送ってくる。タップでそのペインへ遷移。
 //! - タッチ入力は touch-server から受け取る(バー矩形を region として申告)
 //! - アイコンタップで対応 tmux セッションへ遷移(なければ作成してプログラム実行)
 //! - 通常は端末行数を縮めてバー領域を専有し、終了時に復元する(touch-key と同方式)
@@ -20,18 +23,21 @@
 mod actions;
 mod art;
 mod bar;
+mod clawd;
 mod fb;
 mod fb_client;
 mod icons;
 mod mpris;
 mod np;
+mod sprite;
 mod term;
 mod text;
 mod tmux;
 mod touch_client;
 
 use anyhow::Result;
-use bar::{Bar, Hit, NpView};
+use bar::{Bar, ClawdView, Hit, NpView};
+use clawd::Row;
 use mpris::{Pending, PlayerState, Snapshot};
 use np::NowPlaying;
 use std::sync::mpsc;
@@ -130,11 +136,26 @@ impl Np {
     }
 }
 
-/// バー全体を描き直し、パネルを描いたかどうかを返す。
-fn redraw(bar: &Bar, buf: &mut [u8], state: &tmux::State, np: &Np) -> bool {
+/// バー全体を描き直し、(パネルを描いたか, clawd 枠に描いた行) を返す。
+///
+/// 行は当たり判定と部分ブリットの判断にも要るので、描いたものをそのまま返す。
+fn redraw(
+    bar: &Bar,
+    buf: &mut [u8],
+    state: &tmux::State,
+    np: &Np,
+    clawd: &Arc<Mutex<clawd::Model>>,
+    phase: bool,
+) -> (bool, Vec<Row>) {
     let view = np.view();
-    bar.draw(buf, state, view.as_ref());
-    view.is_some()
+    let rows = clawd.lock().unwrap().rows(bar.clawd_rows());
+    bar.draw(buf, state, view.as_ref(), Some(&ClawdView { rows: &rows, phase }));
+    (view.is_some(), rows)
+}
+
+/// 走りアニメーションの位相。`CLAWD_BOB_MS` ごとに反転する。
+fn clawd_phase(since: Instant) -> bool {
+    since.elapsed().as_millis() / bar::CLAWD_BOB_MS % 2 == 1
 }
 
 /// バーバッファから矩形 `r` を切り出して連続バイト列にする(部分ブリット用)。
@@ -149,6 +170,27 @@ fn sub_rect(buf: &[u8], buf_w: u32, r: bar::Rect) -> Vec<u8> {
 }
 
 fn main() -> Result<()> {
+    // 引数なしはデーモン。hook-* は Claude Code の hooks から呼ばれる通知クライアントで、
+    // ソケットへ 1 行送るだけで即戻る(旧 touch-claude の hook コマンド)。
+    match std::env::args().nth(1).as_deref() {
+        None => daemon(),
+        Some("hook-start") => clawd::notify("start"),
+        Some("hook-question") => clawd::notify("question"),
+        Some("hook-answer") => clawd::notify("answer"),
+        Some("hook-stop") => clawd::notify("stop"),
+        Some("hook-end") => clawd::notify("end"),
+        Some("status") => clawd::status(),
+        Some(other) => {
+            eprintln!(
+                "task-var: 未知のサブコマンド {other:?}\n\
+                 usage: task-var [hook-start|hook-question|hook-answer|hook-stop|hook-end|status]"
+            );
+            std::process::exit(2);
+        }
+    }
+}
+
+fn daemon() -> Result<()> {
     let fb = fb::Framebuffer::open()?;
     let (screen_w, screen_h) = (fb.width, fb.height);
 
@@ -175,6 +217,7 @@ fn main() -> Result<()> {
                 if let Some(guard) = g.lock().unwrap().as_ref() {
                     guard.restore();
                 }
+                let _ = std::fs::remove_file(clawd::socket_path());
                 std::process::exit(0);
             }
         });
@@ -190,7 +233,14 @@ fn main() -> Result<()> {
     let art = art::Art::spawn(bar.art_side());
     let mut np = Np::default();
     np.refresh(&art, &player_shared);
-    let mut np_shown = redraw(&bar, &mut buf, &state, &np);
+
+    // 動いている claude。Claude Code の hooks が `task-var hook-*` 経由で送ってくる。
+    let clawd_model: Arc<Mutex<clawd::Model>> = Arc::new(Mutex::new(clawd::Model::default()));
+    clawd::spawn(clawd_model.clone());
+    // 走りアニメーションの位相の基準時刻。
+    let started = Instant::now();
+    let (mut np_shown, mut rows) =
+        redraw(&bar, &mut buf, &state, &np, &clawd_model, clawd_phase(started));
 
     // touch-server クライアント起動。バー表示中は帯全体、非表示中は下端だけを
     // region として申告する(残りは fbhalf 等が受け取れる)。優先度を付けて、
@@ -314,8 +364,12 @@ fn main() -> Result<()> {
         }
 
         // 表示中は自動非表示のチェックと再ブリットのため短周期で回す。
-        // 再生中はさらに短くして進捗バーを滑らかに進める。
-        let timeout = if bar_shown && swipe_mode {
+        // 走っている claude が居る間はアニメーションのコマ送りが一番短い。
+        // 再生中は進捗バーを滑らかに進めるぶんだけ短くする。
+        let running = rows.iter().any(|r| r.st == clawd::St::Run);
+        let timeout = if bar_shown && running {
+            Duration::from_millis(bar::CLAWD_BOB_MS as u64 / 2)
+        } else if bar_shown && swipe_mode {
             Duration::from_millis(200)
         } else if bar_shown && np_shown && np.is_playing() {
             Duration::from_millis(500)
@@ -335,7 +389,8 @@ fn main() -> Result<()> {
                     if swiped_up {
                         state = tmux::State::poll();
                         np.refresh(&art, &player_shared);
-                        np_shown = redraw(&bar, &mut buf, &state, &np);
+                        (np_shown, rows) =
+                            redraw(&bar, &mut buf, &state, &np, &clawd_model, clawd_phase(started));
                         show_bar(&fb, &buf)?;
                         bar_shown = true;
                         last_full = Instant::now();
@@ -355,7 +410,7 @@ fn main() -> Result<()> {
                 }
                 let lx = up.fx1 * screen_w as f64;
                 let ly = up.fy1 * screen_h as f64 - bar_y as f64;
-                match bar.hit(lx, ly, np_shown) {
+                match bar.hit(lx, ly, np_shown, rows.len()) {
                     Some(Hit::Icon(i)) => {
                         if let Err(e) = actions::activate(&actions::ICONS[i], &state) {
                             eprintln!("task-var: {} の起動に失敗: {e:#}", actions::ICONS[i].name);
@@ -365,6 +420,21 @@ fn main() -> Result<()> {
                         let def = actions::spotify();
                         if let Err(e) = actions::activate(def, &state) {
                             eprintln!("task-var: {} の起動に失敗: {e:#}", def.name);
+                        }
+                    }
+                    Some(Hit::Clawd(i)) => {
+                        if let Some(row) = rows.get(i) {
+                            // 終了(黄)のタップは「確認した」ぶん灰へ落としてから遷移する。
+                            clawd_model.lock().unwrap().apply("seen", &row.pane);
+                            match state.client.as_deref() {
+                                Some(client) => {
+                                    eprintln!("task-var: claude のペイン {} へ遷移", row.pane);
+                                    if let Err(e) = tmux::goto_pane(client, &row.pane) {
+                                        eprintln!("task-var: ペイン遷移に失敗: {e:#}");
+                                    }
+                                }
+                                None => eprintln!("task-var: fbterm の tmux クライアントが不明"),
+                            }
                         }
                     }
                     Some(Hit::Ctrl(c)) => {
@@ -383,7 +453,8 @@ fn main() -> Result<()> {
                 }
                 // タップ直後は状態が変わっているはずなので即時更新
                 state = tmux::State::poll();
-                np_shown = redraw(&bar, &mut buf, &state, &np);
+                (np_shown, rows) =
+                    redraw(&bar, &mut buf, &state, &np, &clawd_model, clawd_phase(started));
                 if bar_shown {
                     fb.blit(0, bar_y, screen_w, bar_h, &buf)?;
                     last_full = Instant::now();
@@ -425,10 +496,13 @@ fn main() -> Result<()> {
                         }
                         state = s;
                     }
+                    // 消えたペインの掃除とセッション名の更新も同じ間隔で行う。
+                    clawd::refresh(&clawd_model);
                 }
                 // 再生情報は毎ティック取り込んで描き直す(進捗バーを進めるため)。
                 np.refresh(&art, &player_shared);
-                np_shown = redraw(&bar, &mut buf, &state, &np);
+                (np_shown, rows) =
+                    redraw(&bar, &mut buf, &state, &np, &clawd_model, clawd_phase(started));
 
                 if bar_shown {
                     // 全面ブリットは 1 秒に 1 回(fbterm/fbhalf の再描画で消された
@@ -437,9 +511,17 @@ fn main() -> Result<()> {
                     if last_full.elapsed() >= FULL_BLIT_EVERY {
                         fb.blit(0, bar_y, screen_w, bar_h, &buf)?;
                         last_full = Instant::now();
-                    } else if np_shown {
-                        let r = bar.np_rect();
-                        fb.blit(r.x, bar_y + r.y, r.w, r.h, &sub_rect(&buf, screen_w, r))?;
+                    } else {
+                        if np_shown {
+                            let r = bar.np_rect();
+                            fb.blit(r.x, bar_y + r.y, r.w, r.h, &sub_rect(&buf, screen_w, r))?;
+                        }
+                        // 走っている claude が居る間は枠だけ差し替えてコマを進める。
+                        if running {
+                            if let Some(r) = bar.clawd_rect() {
+                                fb.blit(r.x, bar_y + r.y, r.w, r.h, &sub_rect(&buf, screen_w, r))?;
+                            }
+                        }
                     }
                 }
             }

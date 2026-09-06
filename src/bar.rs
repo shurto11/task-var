@@ -11,12 +11,17 @@
 //!   列③ 操作ボタン 5 個・進捗バー
 //! アイコン列は左寄せ固定。中央寄せだとパネルに必要な幅(既定 560px)が
 //! 取れず、曲名が数文字で切れてしまうため。
+//!
+//! アイコン列と再生情報パネルの間には clawd 枠。動いている Claude Code を
+//! キャラクター + tmux セッション名で最大 4 行ぶん縦に並べる(旧 touch-claude)。
 
 use crate::actions::{IconDef, ICONS};
 use crate::art::Accent;
+use crate::clawd::{Row, St};
 use crate::icons::{self, Glyph};
 use crate::mpris::{Ctrl, Loop, PlayerState};
 use crate::np::NowPlaying;
+use crate::sprite::{self, Sprite};
 use crate::text::Font;
 use crate::tmux::State;
 use anyhow::Result;
@@ -84,6 +89,29 @@ const ARTIST_MIN_PX: f32 = 12.0;
 
 /// 再生/停止グリフは白円の中に入れるので、他より小さく描く。
 const PLAY_GLYPH_PCT: u32 = 58;
+
+// clawd 枠(動いている Claude Code の一覧)。
+/// 縦に並べる最大行数。`TASKVAR_CLAWD_ROWS` で変えられる。
+const CLAWD_ROWS: usize = 4;
+const CLAWD_PAD_X: u32 = 8;
+const CLAWD_PAD_Y: u32 = 4;
+/// 行間(キャラの上下に食わせる余白)。
+const CLAWD_ROW_GAP: u32 = 2;
+/// キャラとセッション名の間隔。
+const CLAWD_NAME_GAP: u32 = 8;
+/// 見出しを縮められる下限。ここまで縮めても入らなければ `…` で詰める。
+const CLAWD_NAME_MIN_PX: f32 = 8.0;
+/// これより狭い場所しか空いていなければ枠ごと出さない。
+const CLAWD_MIN_W: u32 = 96;
+/// 走りアニメーションの上下動(px)。行が低いので touch-claude の 5px より小さい。
+const CLAWD_BOB: u32 = 2;
+/// 走りアニメーションの 1 コマの長さ。
+pub const CLAWD_BOB_MS: u128 = 300;
+
+// 状態ごとのキャラの色(BGR)。処理中は元画像のオレンジをそのまま使う。
+const CLAWD_ASK: [u8; 3] = [217, 144, 74]; // #4A90D9
+const CLAWD_DONE: [u8; 3] = [76, 201, 242]; // #F2C94C
+const CLAWD_SEEN: [u8; 3] = [158, 158, 158]; // #9E9E9E
 
 fn env_u32(name: &str, default: u32) -> u32 {
     std::env::var(name).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
@@ -290,6 +318,64 @@ impl NpLayout {
     }
 }
 
+/// clawd 枠の位置(バーローカル座標)。
+struct ClawdLayout {
+    panel: Rect,
+    /// 上から順の行矩形(枠の内側)。当たり判定もこれで行う。
+    rows: Vec<Rect>,
+    /// キャラの大きさ(全行共通)。
+    sprite_w: u32,
+    sprite_h: u32,
+    name_px: f32,
+}
+
+impl ClawdLayout {
+    /// アイコン列の右端と再生情報パネルの左端の間に置く。
+    /// 幅が足りなければ None(枠ごと出さない)。
+    ///
+    /// パネルの有無で幅を変えたりはしない。曲が止まって再生情報が消えるたびに
+    /// 枠が伸び縮みすると、タップ先が動いて押し間違えるため。
+    fn new(h: u32, icons_right: u32, np_left: u32) -> Option<Self> {
+        let x = icons_right + GAP;
+        let avail = np_left.saturating_sub(GAP).saturating_sub(x);
+        let panel_w = env_opt_u32("TASKVAR_CLAWD_W").unwrap_or(avail).min(avail);
+        if panel_w < CLAWD_MIN_W {
+            return None;
+        }
+        let panel = Rect { x, y: INSET, w: panel_w, h: h.saturating_sub(INSET * 2) };
+        let n = env_u32("TASKVAR_CLAWD_ROWS", CLAWD_ROWS as u32).clamp(1, 8) as usize;
+        let content_h = panel.h.saturating_sub(CLAWD_PAD_Y * 2);
+        let row_h = content_h / n as u32;
+        if row_h <= CLAWD_ROW_GAP {
+            return None;
+        }
+        let sprite_h = row_h - CLAWD_ROW_GAP;
+        let sprite_w = sprite_h * sprite::ASPECT.0 / sprite::ASPECT.1;
+        let row_w = panel.w.saturating_sub(CLAWD_PAD_X * 2);
+        // キャラだけで埋まってしまうならセッション名が出せないので諦める
+        if row_w <= sprite_w + CLAWD_NAME_GAP {
+            return None;
+        }
+        // 行は枠の縦中央に固める(端数は上下へ均等に散らす)
+        let top = panel.y + (panel.h - row_h * n as u32) / 2;
+        let rows = (0..n)
+            .map(|i| Rect { x: panel.x + CLAWD_PAD_X, y: top + i as u32 * row_h, w: row_w, h: row_h })
+            .collect();
+        // 既定は行高の 90%(4 行なら 18px)。行数を変えても行高に比例する。
+        let name_px = env_f32("TASKVAR_CLAWD_PX", (row_h as f32 * 0.9).clamp(9.0, 20.0))
+            .clamp(6.0, row_h as f32);
+        Some(Self { panel, rows, sprite_w, sprite_h, name_px })
+    }
+}
+
+/// clawd 枠に描く内容。main が毎ティック組み立てる。
+pub struct ClawdView<'a> {
+    /// 表示する行(`clawd::Model::rows` が選んだもの)。空なら枠ごと出さない。
+    pub rows: &'a [Row],
+    /// 走りアニメーションの位相。`CLAWD_BOB_MS` ごとに反転させる。
+    pub phase: bool,
+}
+
 /// パネルに描く内容。main が毎ティック組み立てる。
 pub struct NpView<'a> {
     pub np: &'a NowPlaying,
@@ -307,6 +393,8 @@ pub enum Hit {
     Ctrl(Ctrl),
     /// パネル内のボタン以外。spotatui のセッションへ遷移する。
     Panel,
+    /// clawd 枠の n 行目。その claude が動くペインへ遷移する。
+    Clawd(usize),
 }
 
 pub struct Bar {
@@ -321,6 +409,11 @@ pub struct Bar {
     art_fallback: Glyph,
     font: Option<Font>,
     np: NpLayout,
+    clawd: Option<ClawdLayout>,
+    /// キャラのスプライト。読めなければ枠を出さない。
+    sprite: Option<Sprite>,
+    /// clawd 枠の背景グラデーションの起点色。キャラのオレンジから採る。
+    clawd_accent: Accent,
 }
 
 impl Bar {
@@ -355,6 +448,19 @@ impl Bar {
             .collect::<Result<_>>()?;
         let art_fallback = icons::render(ICONS[1].svg, (np.art.w * 55 / 100).max(1))?;
 
+        let clawd = ClawdLayout::new(h, x0 + total, np.panel.x);
+        let sprite = match sprite::load() {
+            Ok(s) => Some(s),
+            Err(e) => {
+                eprintln!("task-var: clawd の画像を読めません(枠は出しません): {e:#}");
+                None
+            }
+        };
+
+        // 起点色は画像のオレンジから 1 回だけ採る(毎フレーム計算する必要はない)。
+        let clawd_accent =
+            sprite.as_ref().map(|s| Accent::from_bgr(s.body)).unwrap_or_default();
+
         Ok(Self {
             w,
             h,
@@ -366,7 +472,23 @@ impl Bar {
             art_fallback,
             font: Font::load(),
             np,
+            clawd,
+            sprite,
+            clawd_accent,
         })
+    }
+
+    /// clawd 枠に並べられる行数。0 なら枠を出せない(場所が無い/画像が無い)。
+    pub fn clawd_rows(&self) -> usize {
+        match (&self.clawd, &self.sprite) {
+            (Some(l), Some(_)) => l.rows.len(),
+            _ => 0,
+        }
+    }
+
+    /// clawd 枠の矩形(バーローカル)。キャラだけ動いたときの部分ブリットに使う。
+    pub fn clawd_rect(&self) -> Option<Rect> {
+        self.clawd.as_ref().map(|l| l.panel)
     }
 
     /// アルバムアートに要求する一辺(px)。
@@ -380,7 +502,13 @@ impl Bar {
     }
 
     /// バー全体を buf(w*h*4 BGRA)へ描画する。
-    pub fn draw(&self, buf: &mut [u8], state: &State, np: Option<&NpView>) {
+    pub fn draw(
+        &self,
+        buf: &mut [u8],
+        state: &State,
+        np: Option<&NpView>,
+        clawd: Option<&ClawdView>,
+    ) {
         for px in buf.chunks_exact_mut(4) {
             px.copy_from_slice(&[BG[0], BG[1], BG[2], 0]);
         }
@@ -389,6 +517,55 @@ impl Bar {
         }
         if let Some(view) = np {
             self.draw_np(buf, view);
+        }
+        if let Some(view) = clawd.filter(|v| !v.rows.is_empty()) {
+            self.draw_clawd(buf, view);
+        }
+    }
+
+    /// clawd 枠を描く。行が 1 つも無いときは呼ばない(枠ごと消える)。
+    fn draw_clawd(&self, buf: &mut [u8], view: &ClawdView) {
+        let (Some(l), Some(sprite)) = (&self.clawd, &self.sprite) else { return };
+
+        // 枠は再生情報パネルと同じ作り: 左端からパネル幅の 65% までで #121212 へ
+        // 落とす斜めのグラデーション。起点の色は**キャラのオレンジから採る**
+        // (`Accent::from_bgr`)。アートのときと同じで色相と彩度だけを受け取り、
+        // 明度は固定なので、見出しの白文字のコントラストは保たれる。
+        round_rect_grad(buf, self.w, self.h, l.panel, 10.0, self.clawd_accent.edge, PANEL_EDGE);
+        let inner =
+            Rect { x: l.panel.x + 1, y: l.panel.y + 1, w: l.panel.w - 2, h: l.panel.h - 2 };
+        round_rect_grad(buf, self.w, self.h, inner, 9.0, self.clawd_accent.fill, PANEL);
+
+        for (row, r) in view.rows.iter().zip(l.rows.iter()) {
+            let body = match row.st {
+                St::Run => sprite.body,
+                St::Ask => CLAWD_ASK,
+                St::Done => CLAWD_DONE,
+                St::Seen => CLAWD_SEEN,
+            };
+            // 処理中は少し縮めて上下に振り、その場で跳ねながら走って見せる。
+            let (sh, dy) = match (row.st, view.phase) {
+                (St::Run, true) => (l.sprite_h.saturating_sub(CLAWD_BOB).max(1), CLAWD_BOB),
+                (St::Run, false) => (l.sprite_h.saturating_sub(CLAWD_BOB).max(1), 0),
+                _ => (l.sprite_h, 0),
+            };
+            let bgra = sprite.render(l.sprite_w, sh, body);
+            let sy = r.y + (r.h - l.sprite_h) / 2 + dy;
+            blit_alpha(buf, self.w, self.h, r.x, sy, l.sprite_w, sh, &bgra);
+
+            // キャラの右に見出し(作業の要約 / ディレクトリ名)。
+            // 確認済み(灰)は文字も落として控えめにする。
+            let Some(font) = &self.font else { continue };
+            let tx = r.x + l.sprite_w + CLAWD_NAME_GAP;
+            let max = (r.x + r.w).saturating_sub(tx) as f32;
+            if max <= 4.0 {
+                continue;
+            }
+            let px = font.shrink_to_fit(&row.label, max, l.name_px, CLAWD_NAME_MIN_PX);
+            let text = font.fit(&row.label, max, px);
+            let color = if row.st == St::Seen { SUB_TEXT } else { WHITE };
+            let base = r.y as f32 + r.h as f32 / 2.0 + px * 0.35;
+            font.draw(buf, self.w, self.h, tx as f32, base, px, color, &text);
         }
     }
 
@@ -513,8 +690,16 @@ impl Bar {
     }
 
     /// バーローカル座標 (lx,ly) が何に当たるか。`np_shown` が false のときは
-    /// パネルを描いていないのでパネル関連の判定を飛ばす。
-    pub fn hit(&self, lx: f64, ly: f64, np_shown: bool) -> Option<Hit> {
+    /// パネルを描いていないのでパネル関連の判定を飛ばす。`clawd_rows` は
+    /// いま描いている clawd の行数(描いていない行は当たらない)。
+    pub fn hit(&self, lx: f64, ly: f64, np_shown: bool, clawd_rows: usize) -> Option<Hit> {
+        if let Some(l) = &self.clawd {
+            for (i, r) in l.rows.iter().take(clawd_rows).enumerate() {
+                if r.contains(lx, ly) {
+                    return Some(Hit::Clawd(i));
+                }
+            }
+        }
         if np_shown {
             for (i, ctrl) in CTRLS.iter().enumerate() {
                 if self.np.ctrl_slot(i).contains(lx, ly) {
@@ -616,6 +801,22 @@ fn blit_round(buf: &mut [u8], w: u32, h: u32, rect: Rect, src: &[u8], r: f32) {
             let s = ((j * rect.w + i) * 4) as usize;
             let cov = round_cov(i, j, rect, r);
             blend(buf, w, h, rect.x + i, rect.y + j, [src[s], src[s + 1], src[s + 2]], cov);
+        }
+    }
+}
+
+/// ストレートアルファの BGRA を下地へ合成する(clawd のスプライト用)。
+/// α をカバレッジとして扱うので、縮小でぼけた輪郭が枠の色へなじむ。
+#[allow(clippy::too_many_arguments)]
+fn blit_alpha(buf: &mut [u8], w: u32, h: u32, x0: u32, y0: u32, sw: u32, sh: u32, src: &[u8]) {
+    for j in 0..sh {
+        for i in 0..sw {
+            let s = ((j * sw + i) * 4) as usize;
+            let a = src[s + 3];
+            if a == 0 {
+                continue;
+            }
+            blend(buf, w, h, x0 + i, y0 + j, [src[s], src[s + 1], src[s + 2]], a as f32 / 255.0);
         }
     }
 }
@@ -740,7 +941,7 @@ mod tests {
             art: art.as_deref(),
             accent: art.as_deref().map(crate::art::accent).unwrap_or_default(),
         };
-        bar.draw(&mut buf, &st, Some(&view));
+        bar.draw(&mut buf, &st, Some(&view), None);
 
         let px = |buf: &[u8], x: u32, y: u32| -> [u8; 3] {
             let off = ((y * w + x) * 4) as usize;
@@ -777,34 +978,46 @@ mod tests {
         assert_eq!(px(&buf, prog.x + prog.w - 2, prog.y + prog.h / 2), GROOVE);
 
         // 当たり判定: アイコン中心はヒット、アイコン列の左外は外れ
-        assert_eq!(bar.hit(cx as f64, cy as f64, true), Some(Hit::Icon(1)));
-        assert_eq!(bar.hit(2.0, cy as f64, true), None);
+        assert_eq!(bar.hit(cx as f64, cy as f64, true, 0), Some(Hit::Icon(1)));
+        assert_eq!(bar.hit(2.0, cy as f64, true, 0), None);
 
         // 列③の 5 スロットの中心はそれぞれのボタンを返す
         for (i, ctrl) in CTRLS.iter().enumerate() {
             let s = bar.np.ctrl_slot(i);
             let (sx, sy) = ((s.x + s.w / 2) as f64, (s.y + s.h / 2) as f64);
-            assert_eq!(bar.hit(sx, sy, true), Some(Hit::Ctrl(*ctrl)), "スロット {i}");
+            assert_eq!(bar.hit(sx, sy, true, 0), Some(Hit::Ctrl(*ctrl)), "スロット {i}");
             // パネル非表示中はボタン判定をしない
-            assert_eq!(bar.hit(sx, sy, false), None, "非表示時のスロット {i}");
+            assert_eq!(bar.hit(sx, sy, false, 0), None, "非表示時のスロット {i}");
         }
 
         // ボタン以外のパネル内(アート・曲名・左端の余白)は遷移扱い
         let a = bar.np.art;
         let art_c = ((a.x + a.w / 2) as f64, (a.y + a.h / 2) as f64);
-        assert_eq!(bar.hit(art_c.0, art_c.1, true), Some(Hit::Panel), "アルバムアート");
+        assert_eq!(bar.hit(art_c.0, art_c.1, true, 0), Some(Hit::Panel), "アルバムアート");
         let p = bar.np.panel;
         let text_y = (p.y + p.h / 2) as f64;
-        assert_eq!(bar.hit(bar.np.col2_x as f64 + 4.0, text_y, true), Some(Hit::Panel), "曲名");
-        assert_eq!(bar.hit((p.x + 2) as f64, text_y, true), Some(Hit::Panel), "パネル左端");
+        assert_eq!(bar.hit(bar.np.col2_x as f64 + 4.0, text_y, true, 0), Some(Hit::Panel), "曲名");
+        assert_eq!(bar.hit((p.x + 2) as f64, text_y, true, 0), Some(Hit::Panel), "パネル左端");
         // パネルの外と、パネル非表示中は当たらない
-        assert_eq!(bar.hit((p.x - 4) as f64, text_y, true), None, "パネルの左外");
-        assert_eq!(bar.hit(art_c.0, art_c.1, false), None, "非表示時のアート");
+        assert_eq!(bar.hit((p.x - 4) as f64, text_y, true, 0), None, "パネルの左外");
+        assert_eq!(bar.hit(art_c.0, art_c.1, false, 0), None, "非表示時のアート");
 
         // TASKVAR_TEST_DUMP=path で目視確認用の PPM を書き出す。
         // トグルの ON/OFF でグリフと色が変わるので、両方の状態を出す
-        // (path と path.off の 2 枚)。
+        // (path と path.off の 2 枚)。clawd 枠も 4 状態そろえて入れる。
         if let Ok(path) = std::env::var("TASKVAR_TEST_DUMP") {
+            let clawd_rows = [
+                ("touch-claude廃止とセッション表示枠", St::Run),
+                ("フレームバッファの周辺知識", St::Ask),
+                ("task-var", St::Done),
+                ("dopagaki", St::Seen),
+            ]
+            .iter()
+            .enumerate()
+            .map(|(i, (s, st))| Row { pane: format!("%{i}"), label: s.to_string(), st: *st })
+            .collect::<Vec<_>>();
+            let clawd = ClawdView { rows: &clawd_rows, phase: false };
+            bar.draw(&mut buf, &st, Some(&view), Some(&clawd));
             let dump = |buf: &[u8], to: &str| {
                 let mut ppm = format!("P6\n{w} {h}\n255\n").into_bytes();
                 for p in buf.chunks_exact(4) {
@@ -813,14 +1026,14 @@ mod tests {
                 std::fs::write(to, ppm).unwrap();
             };
             dump(&buf, &path);
-            // シャッフル OFF / 1 曲リピート / 停止中
+            // シャッフル OFF / 1 曲リピート / 停止中、走りアニメの逆位相
             let off = NpView {
                 np: &np,
                 player: PlayerState { playing: false, shuffle: false, repeat: Loop::Track },
                 art: art.as_deref(),
                 accent: art.as_deref().map(crate::art::accent).unwrap_or_default(),
             };
-            bar.draw(&mut buf, &st, Some(&off));
+            bar.draw(&mut buf, &st, Some(&off), Some(&ClawdView { rows: &clawd_rows, phase: true }));
             dump(&buf, &format!("{path}.off"));
         }
     }
@@ -830,10 +1043,99 @@ mod tests {
         let (w, h) = (1366u32, 96u32);
         let bar = Bar::new(w, h).unwrap();
         let mut buf = vec![0u8; (w * h * 4) as usize];
-        bar.draw(&mut buf, &state("spotify", &["spotify"]), None);
+        bar.draw(&mut buf, &state("spotify", &["spotify"]), None, None);
         let p = bar.np_rect();
         let off = (((p.y + 2) * w + p.x + p.w / 2) * 4) as usize;
         assert_eq!([buf[off], buf[off + 1], buf[off + 2]], BG, "パネル無しなら黒のまま");
+    }
+
+    #[test]
+    fn clawd_frame_sits_between_the_icons_and_the_panel() {
+        let bar = Bar::new(1366, 96).unwrap();
+        assert_eq!(bar.clawd_rows(), CLAWD_ROWS, "既定は 4 行");
+        let l = bar.clawd.as_ref().unwrap();
+
+        let icons_right = bar.xs[6] + bar.circle_d;
+        assert!(l.panel.x > icons_right, "アイコン列に重なっている");
+        assert!(l.panel.x + l.panel.w <= bar.np_rect().x, "再生情報パネルに重なっている");
+        assert_eq!(bar.clawd_rect(), Some(l.panel));
+
+        // 行はすべて枠の内側。上下の余りは均等に散る
+        for (i, r) in l.rows.iter().enumerate() {
+            assert!(r.y >= l.panel.y && r.y + r.h <= l.panel.y + l.panel.h, "行 {i} が縦にはみ出す");
+            assert!(r.x >= l.panel.x && r.x + r.w <= l.panel.x + l.panel.w, "行 {i} が横にはみ出す");
+            assert!(l.sprite_w + CLAWD_NAME_GAP < r.w, "行 {i} に見出しの場所が無い");
+        }
+        // 既定の見出しは 18px(行高 20px の 90%)
+        assert_eq!(l.name_px, 18.0, "既定の文字サイズが変わっている");
+
+        let above = l.rows[0].y - l.panel.y;
+        let below = (l.panel.y + l.panel.h) - (l.rows[CLAWD_ROWS - 1].y + l.rows[0].h);
+        assert!(above.abs_diff(below) <= 1, "上下の余白が揃っていない: 上 {above} / 下 {below}");
+
+        // 場所が無ければ枠ごと諦める(アイコン列が伸びてパネルと詰まったとき)
+        assert!(ClawdLayout::new(96, 900, 960).is_none(), "狭くても枠を出そうとしている");
+    }
+
+    #[test]
+    fn clawd_rows_draw_and_hit() {
+        let (w, h) = (1366u32, 96u32);
+        let bar = Bar::new(w, h).unwrap();
+        let mut buf = vec![0u8; (w * h * 4) as usize];
+        let st = state("main", &["main"]);
+        let rows = vec![
+            Row { pane: "%1".into(), label: "main".into(), st: St::Run },
+            Row { pane: "%2".into(), label: "task-var".into(), st: St::Done },
+        ];
+        bar.draw(&mut buf, &st, None, Some(&ClawdView { rows: &rows, phase: false }));
+
+        let px = |buf: &[u8], x: u32, y: u32| -> [u8; 3] {
+            let off = ((y * w + x) * 4) as usize;
+            [buf[off], buf[off + 1], buf[off + 2]]
+        };
+        let l = bar.clawd.as_ref().unwrap();
+        let sprite = bar.sprite.as_ref().unwrap();
+
+        // 背景は左端がキャラのオレンジ由来の色、右端は素のパネル色へ落ちる
+        let left = px(&buf, l.panel.x + 3, l.panel.y + l.panel.h / 2);
+        assert!(
+            left.iter().zip(bar.clawd_accent.fill).all(|(a, b)| a.abs_diff(b) <= 12),
+            "左端が accent の色になっていない: {left:?} vs {:?}",
+            bar.clawd_accent.fill
+        );
+        assert_eq!(px(&buf, l.panel.x + l.panel.w - 6, l.panel.y + l.panel.h - 4), PANEL);
+
+        // 各行のキャラが状態の色で塗られている
+        let has = |buf: &[u8], r: Rect, c: [u8; 3]| {
+            (0..l.sprite_w).any(|i| (0..r.h).any(|j| px(buf, r.x + i, r.y + j) == c))
+        };
+        assert!(has(&buf, l.rows[0], sprite.body), "処理中の行が元のオレンジで描かれていない");
+        assert!(has(&buf, l.rows[1], CLAWD_DONE), "終了の行が黄で描かれていない");
+        // 描いていない 3 行目は素のパネル色
+        assert!(!has(&buf, l.rows[2], sprite.body) && !has(&buf, l.rows[2], CLAWD_DONE));
+
+        // 見出しはキャラの右に出る(パネル色でないピクセルがある)
+        let r = l.rows[0];
+        let name_x = r.x + l.sprite_w + CLAWD_NAME_GAP;
+        assert!(
+            (name_x..r.x + r.w).any(|x| (r.y..r.y + r.h).any(|y| px(&buf, x, y) != PANEL)),
+            "見出しが描かれていない(フォントが無い環境かもしれない)"
+        );
+
+        // 当たり判定: 描いた 2 行だけが当たる
+        let center = |r: Rect| ((r.x + r.w / 2) as f64, (r.y + r.h / 2) as f64);
+        let (x0, y0) = center(l.rows[0]);
+        assert_eq!(bar.hit(x0, y0, false, rows.len()), Some(Hit::Clawd(0)));
+        let (x1, y1) = center(l.rows[1]);
+        assert_eq!(bar.hit(x1, y1, false, rows.len()), Some(Hit::Clawd(1)));
+        let (x2, y2) = center(l.rows[2]);
+        assert_eq!(bar.hit(x2, y2, false, rows.len()), None, "描いていない行は当たらない");
+        assert_eq!(bar.hit(x0, y0, false, 0), None, "枠が空なら当たらない");
+
+        // 行が無いときは枠ごと出さない(バー背景のまま)
+        let mut empty = vec![0u8; (w * h * 4) as usize];
+        bar.draw(&mut empty, &st, None, Some(&ClawdView { rows: &[], phase: false }));
+        assert_eq!(px(&empty, l.panel.x + l.panel.w / 2, l.panel.y + l.panel.h / 2), BG);
     }
 
     #[test]

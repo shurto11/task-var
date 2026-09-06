@@ -4,6 +4,8 @@
 #   scripts/restart.sh                       # 既定値で起動
 #   TASKVAR_TITLE_PX=24 scripts/restart.sh   # 曲名を 24px にして起動
 #   TASKVAR_TITLE_PX=24 TASKVAR_ARTIST_PX=18 scripts/restart.sh
+#   TASKVAR_CLAWD_PX=14 scripts/restart.sh   # clawd 枠の見出しを 14px に(既定 18px)
+#   TASKVAR_CLAWD_ROWS=3 scripts/restart.sh  # 3 行にする(行高が上がり見出しも大きくなる)
 #
 # 環境変数はそのまま引き継ぐので、~/bin/tmux-autostart を書き換えずに試せる。
 # 気に入った値が決まったら、その行の nohup の前に付けて永続させる。
