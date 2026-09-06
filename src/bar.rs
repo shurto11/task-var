@@ -35,6 +35,14 @@ const GREEN: [u8; 3] = [0x60, 0xD7, 0x1E]; // #1ED760 アクセント
 const SUB_TEXT: [u8; 3] = [0xB3, 0xB3, 0xB3]; // #B3B3B3 アーティスト名
 const GROOVE: [u8; 3] = [0x53, 0x53, 0x53]; // #535353 進捗バーの溝
 const ART_BG: [u8; 3] = [0x28, 0x28, 0x28]; // アート未取得時の下地
+// 背景のグラデーション。左端の暗いグリーンから右の #121212 へ落とす。
+// アクセントの #1ED760 をそのまま敷くと白文字が読めないので、暗く落とした
+// 同系色を使う(白とのコントラスト比は約 8:1)。
+const GRAD_GREEN: [u8; 3] = [0x28, 0x5A, 0x0C]; // #0C5A28
+const GRAD_EDGE: [u8; 3] = [0x45, 0x8A, 0x1A]; // #1A8A45 枠線の左端
+/// グラデーションが単色へ落ち着くまでの横幅(パネル幅に対する割合)。
+/// ボタン列(左から約 60%)より手前で落とし切り、白いグリフを素の暗色に乗せる。
+const GRAD_SPREAD: f32 = 0.65;
 
 /// 操作ボタンのグリフ(assets/ の手書き SVG)。
 const G_SHUFFLE: usize = 0;
@@ -419,15 +427,15 @@ impl Bar {
     fn draw_np(&self, buf: &mut [u8], view: &NpView) {
         let l = &self.np;
         // パネル: 枠線の角丸矩形の内側を 1px 詰めて塗る
-        round_rect(buf, self.w, self.h, l.panel, 10.0, PANEL_EDGE);
+        round_rect_grad(buf, self.w, self.h, l.panel, 10.0, GRAD_EDGE, PANEL_EDGE);
         let inner =
             Rect { x: l.panel.x + 1, y: l.panel.y + 1, w: l.panel.w - 2, h: l.panel.h - 2 };
-        round_rect(buf, self.w, self.h, inner, 9.0, PANEL);
+        round_rect_grad(buf, self.w, self.h, inner, 9.0, GRAD_GREEN, PANEL);
 
         // 列①: アルバムアート(角は 6px の丸め。パネル色へブレンドして落とす)
         match view.art {
             Some(bgra) if bgra.len() >= (l.art.w * l.art.h * 4) as usize => {
-                blit_round(buf, self.w, self.h, l.art, bgra, 6.0, PANEL);
+                blit_round(buf, self.w, self.h, l.art, bgra, 6.0);
             }
             _ => {
                 round_rect(buf, self.w, self.h, l.art, 6.0, ART_BG);
@@ -549,14 +557,38 @@ fn round_cov(i: u32, j: u32, rect: Rect, r: f32) -> f32 {
     (r - (dx * dx + dy * dy).sqrt() + 0.5).clamp(0.0, 1.0)
 }
 
-/// 角丸矩形を単色で塗る(角は 1px の線形カバレッジ)。
-fn round_rect(buf: &mut [u8], w: u32, h: u32, rect: Rect, r: f32, color: [u8; 3]) {
+/// 矩形内のピクセル (i,j) における `from`→`to` のグラデーション色。
+/// 横方向を主に、少しだけ斜めへ倒す。`GRAD_SPREAD` から右はもう `to` の単色。
+fn grad_at(i: u32, j: u32, rect: Rect, from: [u8; 3], to: [u8; 3]) -> [u8; 3] {
+    let u = i as f32 / rect.w.max(1) as f32;
+    let v = j as f32 / rect.h.max(1) as f32;
+    let t = ((u * 0.85 + v * 0.15) / GRAD_SPREAD).clamp(0.0, 1.0);
+    let t = t * t * (3.0 - 2.0 * t); // falloff の折れ目を目立たせない
+    std::array::from_fn(|k| (from[k] as f32 + (to[k] as f32 - from[k] as f32) * t).round() as u8)
+}
+
+/// 角丸矩形をグラデーションで塗る(角は 1px の線形カバレッジ)。
+fn round_rect_grad(
+    buf: &mut [u8],
+    w: u32,
+    h: u32,
+    rect: Rect,
+    r: f32,
+    from: [u8; 3],
+    to: [u8; 3],
+) {
     let r = r.min(rect.w as f32 / 2.0).min(rect.h as f32 / 2.0).max(0.0);
     for j in 0..rect.h {
         for i in 0..rect.w {
-            blend(buf, w, h, rect.x + i, rect.y + j, color, round_cov(i, j, rect, r));
+            let c = grad_at(i, j, rect, from, to);
+            blend(buf, w, h, rect.x + i, rect.y + j, c, round_cov(i, j, rect, r));
         }
     }
+}
+
+/// 角丸矩形を単色で塗る。
+fn round_rect(buf: &mut [u8], w: u32, h: u32, rect: Rect, r: f32, color: [u8; 3]) {
+    round_rect_grad(buf, w, h, rect, r, color, color);
 }
 
 /// 塗りつぶし円(再生/停止ボタンの下地)。
@@ -571,18 +603,14 @@ fn circle(buf: &mut [u8], w: u32, h: u32, x0: u32, y0: u32, d: u32, color: [u8; 
     }
 }
 
-/// BGRA 画像を角丸で貼る。角の外は `bg`(パネル色)へ落とす。
-fn blit_round(buf: &mut [u8], w: u32, h: u32, rect: Rect, src: &[u8], r: f32, bg: [u8; 3]) {
+/// BGRA 画像を角丸で貼る。角の外は下地(すでに描いたパネル)をそのまま残すので、
+/// 背景がグラデーションでも角が浮かない。
+fn blit_round(buf: &mut [u8], w: u32, h: u32, rect: Rect, src: &[u8], r: f32) {
     for j in 0..rect.h {
         for i in 0..rect.w {
             let s = ((j * rect.w + i) * 4) as usize;
             let cov = round_cov(i, j, rect, r);
-            let px = [
-                (src[s] as f32 * cov + bg[0] as f32 * (1.0 - cov)) as u8,
-                (src[s + 1] as f32 * cov + bg[1] as f32 * (1.0 - cov)) as u8,
-                (src[s + 2] as f32 * cov + bg[2] as f32 * (1.0 - cov)) as u8,
-            ];
-            blend(buf, w, h, rect.x + i, rect.y + j, px, 1.0);
+            blend(buf, w, h, rect.x + i, rect.y + j, [src[s], src[s + 1], src[s + 2]], cov);
         }
     }
 }
@@ -714,7 +742,10 @@ mod tests {
         // パネルは黒ではなく Spotify のパネル色で塗られている
         let p = bar.np_rect();
         assert!(p.x > icons_right, "パネルはアイコン列より右");
-        assert_eq!(px(&buf, p.x + p.w / 2, p.y + 2), PANEL, "パネル内側はパネル色");
+        // 背景は左のグリーンから右の素の暗色へ落ちる
+        let left = px(&buf, p.x + 4, p.y + p.h / 2);
+        assert!(left[1] > left[2] + 24, "左端がグリーンに寄っていない: {left:?}");
+        assert_eq!(px(&buf, p.x + p.w - 4, p.y + p.h / 2), PANEL, "右端は素のパネル色");
 
         // 進捗バー: 塗り部分は緑、末尾側は溝の色
         let prog = bar.np.prog;
