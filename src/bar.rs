@@ -72,9 +72,10 @@ const BTN_ENV: [&str; 5] = [
     "TASKVAR_BTN_D_REPEAT",
 ];
 
-/// 曲名・アーティストが列に収まらないとき、既定サイズの何割まで縮めるか。
+/// 曲名・アーティストが列に収まらないときに縮められる下限。
 /// ここまで縮めても入らなければ、諦めて末尾を `…` で詰める。
-const MIN_SHRINK: f32 = 0.55;
+const TITLE_MIN_PX: f32 = 22.0;
+const ARTIST_MIN_PX: f32 = 12.0;
 
 /// 再生/停止グリフは白円の中に入れるので、他より小さく描く。
 const PLAY_GLYPH_PCT: u32 = 58;
@@ -447,17 +448,9 @@ impl Bar {
             if max > 4.0 {
                 // 収まらないときはまず文字を縮めて入れる。下限まで縮めても
                 // 入らない場合だけ `…` で詰める。
-                let title_px =
-                    font.shrink_to_fit(&view.np.track, max, l.title_px, l.title_px * MIN_SHRINK);
-                // 曲名が縮んだ割合をアーティストにも掛ける。同じ値に揃えると
-                // 2 行が同じ大きさになって見出しの上下関係が消えるため。
-                let artist_pref = l.artist_px * (title_px / l.title_px);
-                let artist_px = font.shrink_to_fit(
-                    &view.np.artist,
-                    max,
-                    artist_pref,
-                    l.artist_px * MIN_SHRINK,
-                );
+                let title_px = font.shrink_to_fit(&view.np.track, max, l.title_px, TITLE_MIN_PX);
+                let artist_px =
+                    font.shrink_to_fit(&view.np.artist, max, l.artist_px, ARTIST_MIN_PX);
 
                 let title = font.fit(&view.np.track, max, title_px);
                 let base1 = l.row1_y as f32 + l.row1_h as f32 / 2.0 + title_px * 0.35;
