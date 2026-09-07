@@ -76,8 +76,9 @@ const GROOVE: [u8; 3] = [0x78, 0x55, 0x4A]; // #4A5578 進捗バーの溝
 const ART_BG: [u8; 3] = [0x50, 0x30, 0x26]; // #263050 アート未取得時の下地
 // 背景のグラデーション。左端の色はアルバムアートから採る(art::Accent)。
 /// グラデーションが単色へ落ち着くまでの横幅(パネル幅に対する割合)。
-/// ボタン列(左から約 60%)より手前で落とし切り、白いグリフを素の暗色に乗せる。
-const GRAD_SPREAD: f32 = 0.65;
+/// 大きいほど境目が右へ寄る。ボタン列(左から約 60%)の手前で落とし切るのを
+/// やめて、ボタンのあたりでようやく素の暗色へ着くところまで伸ばしてある。
+const GRAD_SPREAD: f32 = 0.8;
 
 /// 操作ボタンのグリフ(assets/ の手書き SVG)。
 const G_SHUFFLE: usize = 0;
@@ -1405,8 +1406,13 @@ mod tests {
             (l.col2_x..l.col2_x + l.col2_w).all(|x| (p.y + 4..p.y + p.h - 4).all(|y| dark(x, y))),
             "枠だけのはずが曲名の列に何か描かれている"
         );
+        // ボタンの場所はほぼ素のパネル色(グラデーションの残りぶんだけ僅かに寄る)
         let btn = l.btn_xs[2] + l.btn_d[2] / 2;
-        assert_eq!(px(btn, l.btn_y[2] + l.btn_d[2] / 2), PANEL, "ボタンが描かれている");
+        let at_btn = px(btn, l.btn_y[2] + l.btn_d[2] / 2);
+        assert!(
+            at_btn.iter().zip(PANEL).all(|(a, b)| a.abs_diff(b) <= 8),
+            "ボタンが描かれている: {at_btn:?}"
+        );
         let prog = l.prog;
         assert_ne!(px(prog.x + 2, prog.y + prog.h / 2), GREEN, "進捗バーが描かれている");
 
