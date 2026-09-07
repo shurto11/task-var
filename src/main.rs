@@ -199,7 +199,7 @@ fn daemon() -> Result<()> {
     let (screen_w, screen_h) = (fb.width, fb.height);
 
     // バー占有領域(下部)。上端を端末セル境界へスナップして隙間を無くす
-    let mut bar_h = env_u32("TASKVAR_BAR_H", 88).clamp(24, screen_h / 2);
+    let mut bar_h = env_u32("TASKVAR_BAR_H", 64).clamp(24, screen_h / 2);
     let mut bar_y = screen_h - bar_h;
     if let Some(cell_h) = term::cell_height(screen_w) {
         bar_y = bar_y / cell_h * cell_h;

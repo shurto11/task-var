@@ -1,10 +1,11 @@
 //! タスクバーのレイアウト・描画・当たり判定。
 //!
 //! バーは画面下部の全幅の帯(BGRA バッファ)。左に clawd 枠、中央にセッション切替の
-//! 白円アイコンを横一列、右に Spotify の再生情報パネルを置く。
-//! 外枠リング: 表示中セッション=青 / 存在するが非表示=灰 / セッション無し=枠なし。
-//! tmux アイコンはセッションに対応しないため、「名前付きセッション以外を表示中」の
-//! ときに青リングにする(通常の作業セッションにいる状態を表す)。
+//! 白円アイコンを横一列(外枠リングは持たない)、右に Spotify の再生情報パネルを置く。
+//! 白円の下の下線: 表示中セッション=水色 / 存在するが非表示=灰色 /
+//! セッション無し=下線なし。長さは同じで、違うのは色だけ。
+//! tmux アイコンはセッションに対応せず閉じることが無いので、下線が消えることはない
+//! (名前付きセッション以外を表示中=水色、名前付きセッションを見ている間=灰色)。
 //!
 //! 再生情報パネルは 2 行 3 列:
 //!   列① アルバムアート(2 行ぶち抜き) / 列② 曲名・アーティスト /
@@ -31,17 +32,35 @@ const BG: [u8; 3] = [0xFA, 0xE0, 0xD6];
 const WHITE: [u8; 3] = [255, 255, 255];
 /// 白円の上に乗せるグリフの色(再生/停止ボタン)。地色とは独立。
 const BLACK: [u8; 3] = [0, 0, 0];
-const BLUE: [u8; 3] = [255, 144, 30]; // #1E90FF
+const BLUE: [u8; 3] = [255, 144, 30]; // #1E90FF 水色の下線
 const GRAY: [u8; 3] = [128, 128, 128];
-/// リングの太さ(px)。
-const RING_W: f32 = 4.0;
+
+// アイコン下の下線。外枠リングの代わりに、開いているかどうかはこれが示す。
+/// 下線の太さ(px)。
+const MARK_H: u32 = 4;
+/// グリフの下端と下線の間隔(px)。
+const MARK_GAP: u32 = 4;
+/// 下線の長さ。タイル幅に対する割合(水色・灰色とも同じで、違うのは色だけ)。
+const MARK_PCT: u32 = 50;
+/// 円の外側どこまでをアイコンのタッチとして拾うか(px)。
+const ICON_HIT_PAD: u32 = 8;
+/// グリフの大きさ。白円の直径に対する割合。
+const ICON_GLYPH_PCT: u32 = 58;
+/// 白円の直径の既定。バー高さに対する割合(既定の 88px バーで 64px になる)。
+/// `TASKVAR_BAR_H` だけ変えてもアイコンが一緒に育つように比で持つ。
+const ICON_D_PCT: u32 = 73;
+/// 白円の直径の下限。これ以下にはしない(グリフが潰れて見分けられなくなる)。
+const ICON_D_MIN: u32 = 16;
+/// アイコン列が広がっても、左右の枠にはこれだけの幅を残す。
+/// アイコンを大きくしすぎたときに再生情報パネルが消えるのを防ぐ。
+const NP_MIN_W: u32 = 200;
 
 // 影。明るい地色の上でアイコンの白円と 2 つの枠が浮いて見えるように真下へ敷く。
 /// 影の色(#1E2D5A 相当)。地色が青みなので黒ではなく暗い青にする。
 const SHADOW: [u8; 3] = [0x5A, 0x2D, 0x1E];
-/// 円の真下での影の濃さ。ここからぼかし幅ぶんかけて 0 へ落とす。
+/// 円(枠は縁)の真下での影の濃さ。ここからぼかし幅ぶんかけて 0 へ落とす。
 const SHADOW_A: f32 = 0.30;
-/// 影のぼかし幅(px)。円の外側へこのぶん広がる。
+/// 影のぼかし幅(px)。円や枠の外側へこのぶん広がる。
 const SHADOW_BLUR: f32 = 7.0;
 /// 影を下へずらす量(px)。光が上から当たっているように見せる。
 const SHADOW_DY: f32 = 3.0;
@@ -83,7 +102,7 @@ pub const CTRLS: [Ctrl; 5] =
 
 /// ボタンごとの既定の大きさ。並びは `CTRLS` と揃える。
 /// 再生/停止を大きく、曲送りを小さく、トグルはその中間にしてある。
-const BTN_D_DEFAULT: [u32; 5] = [20, 16, 35, 16, 20];
+const BTN_D_DEFAULT: [u32; 5] = [20, 16, 30, 16, 20];
 
 /// ボタンごとの大きさを指定する env var。並びは `CTRLS` と揃える。
 /// 未指定のものは `TASKVAR_BTN_D`(5 つ共通の上書き)、それも無ければ
@@ -96,10 +115,17 @@ const BTN_ENV: [&str; 5] = [
     "TASKVAR_BTN_D_REPEAT",
 ];
 
-/// 曲名・アーティストが列に収まらないときに縮められる下限。
-/// ここまで縮めても入らなければ、諦めて末尾を `…` で詰める。
-const TITLE_MIN_PX: f32 = 22.0;
-const ARTIST_MIN_PX: f32 = 12.0;
+/// 曲名・アーティスト名の大きさ。行の高さやバーの高さからは決めず、
+/// ここで決め打ちする(`TASKVAR_TITLE_PX` / `TASKVAR_ARTIST_PX` で変えられる)。
+/// バーを高くしても文字はそのまま、大きくしたければ自分で指定する。
+const TITLE_PX: f32 = 26.0;
+const ARTIST_PX: f32 = 16.0;
+/// 文字サイズの許容範囲(env で極端な値を渡されたときの歯止め)。
+const TEXT_PX_RANGE: (f32, f32) = (6.0, 200.0);
+/// 列に収まらないときに縮められる下限。指定サイズに対する割合で持つので、
+/// 大きさを変えても縮み方は変わらない。ここまで縮めても入らなければ
+/// 諦めて末尾を `…` で詰める。
+const SHRINK_MIN_PCT: f32 = 0.75;
 
 /// 再生/停止グリフは白円の中に入れるので、他より小さく描く。
 const PLAY_GLYPH_PCT: u32 = 58;
@@ -204,8 +230,8 @@ const INSET: u32 = 4; // バー上下からの余白
 const PAD: u32 = 8; // パネル内側の余白
 const GAP: u32 = 12; // 列間
 const BTN_GAP: u32 = 10;
-/// ボタン列と進捗バーの間隔。
-const CTRL_GAP: u32 = 16;
+/// ボタン列と進捗バーの間隔。`TASKVAR_CTRL_GAP` で詰めたり広げたりできる。
+const CTRL_GAP: u32 = 5;
 
 /// パネルの幅を決める。
 ///
@@ -226,19 +252,23 @@ impl NpLayout {
     /// から算出する。avail は呼び手が「同じ幅の clawd 枠とアイコン列が左に並ぶ」
     /// ぶんを差し引いて渡す(`Bar::new`)。
     fn new(w: u32, h: u32, margin: u32, avail: u32) -> Self {
+        // バー高さは env で変えられるので、低くしても破綻しないよう飽和で詰める。
         let panel_h = h.saturating_sub(INSET * 2);
-        let content_h = panel_h - PAD * 2;
+        let content_h = panel_h.saturating_sub(PAD * 2).max(1);
         // 行の分割は content_h だけで決まる(上段=曲名/ボタン、下段=アーティスト/進捗バー)。
-        let row1_h = content_h / 2 + 2;
+        let row1_h = (content_h / 2 + 2).min(content_h);
         let row2_h = content_h - row1_h;
 
         // 列①のアルバムアートは行をぶち抜く正方形、列③はボタン 5 個ぶん。
         // この 2 つは先に決まるので、パネル幅はそこから逆算できる。
         // ボタンは自分の行に収まる大きさまで(2x3 グリッドの升目をはみ出さない)。
         // 進捗バーの高さは先に決める。ボタンの上限がこれに依存するため。
-        let prog_h = env_u32("TASKVAR_PROG_H", (content_h / 18).clamp(3, 8)).clamp(2, content_h / 2);
+        let prog_h =
+            env_u32("TASKVAR_PROG_H", (content_h / 18).clamp(3, 8)).clamp(1, (content_h / 2).max(1));
         // ボタンは「進捗バーと合わせてパネルの高さに収まる」ところまで。
-        let btn_cap = panel_h.saturating_sub(CTRL_GAP + prog_h);
+        // ボタン列と進捗バーの間隔。パネルからはみ出さないところまでで頭打ち。
+        let ctrl_gap = env_u32("TASKVAR_CTRL_GAP", CTRL_GAP).min(panel_h.saturating_sub(prog_h));
+        let btn_cap = panel_h.saturating_sub(ctrl_gap + prog_h);
         // 個別指定 > 5 つ共通の TASKVAR_BTN_D > ボタンごとの既定
         let base = env_opt_u32("TASKVAR_BTN_D");
         let want: [u32; 5] = std::array::from_fn(|i| {
@@ -282,9 +312,10 @@ impl NpLayout {
         // パネルの縦中央に置く。行に揃えると上へ寄って見えるため。
         // `TASKVAR_CTRL_DY` で上下に微調整できる(パネルからは出ない)。
         let btn_max = btn_d.iter().copied().max().unwrap_or(0);
-        let group_h = btn_max + CTRL_GAP + prog_h;
+        let group_h = btn_max + ctrl_gap + prog_h;
         let centered = panel.y + panel_h.saturating_sub(group_h) / 2;
-        let lowest = (panel.y + panel_h).saturating_sub(group_h);
+        // 低いバーではボタン群が入り切らない。その場合は上端で止める(min > max 回避)。
+        let lowest = (panel.y + panel_h).saturating_sub(group_h).max(panel.y);
         let group_y = (centered as i64 + env_i32("TASKVAR_CTRL_DY", 0) as i64)
             .clamp(panel.y as i64, lowest as i64) as u32;
         let btn_y = btn_d.map(|d| group_y + (btn_max - d) / 2);
@@ -301,7 +332,7 @@ impl NpLayout {
         // 進捗バーはボタン列の直下、同じ幅で。
         let prog = Rect {
             x: col3_x,
-            y: group_y + btn_max + CTRL_GAP,
+            y: group_y + btn_max + ctrl_gap,
             // 端のボタンに合わせる(狭くて縮めたときも列③の名目幅とズレない)
             w: (btn_xs[4] + btn_d[4]).saturating_sub(col3_x),
             h: prog_h,
@@ -320,14 +351,13 @@ impl NpLayout {
             btn_xs,
             btn_y,
             prog,
-            // 既定はパネル高に比例させる。係数は 1366x768(バー高 96px →
-            // content_h 72px)でちょうど曲名 28px・アーティスト 22px になる値。
-            // 一時的に変えたいときは TASKVAR_TITLE_PX / TASKVAR_ARTIST_PX で
-            // 上書きできる(行に収まる範囲へ丸めるので両行は重ならない)。
-            title_px: env_f32("TASKVAR_TITLE_PX", (content_h as f32 * 0.3889).clamp(12.0, 28.0))
-                .clamp(6.0, row1_h as f32),
-            artist_px: env_f32("TASKVAR_ARTIST_PX", (content_h as f32 * 0.3056).clamp(10.0, 22.0))
-                .clamp(6.0, row2_h as f32),
+            // 文字の大きさは行の高さから決めない。既定は TITLE_PX / ARTIST_PX の
+            // 決め打ちで、TASKVAR_TITLE_PX / TASKVAR_ARTIST_PX で好きな値にできる
+            // (バーを低くしても縮まないので、その場合は自分で下げる)。
+            title_px: env_f32("TASKVAR_TITLE_PX", TITLE_PX)
+                .clamp(TEXT_PX_RANGE.0, TEXT_PX_RANGE.1),
+            artist_px: env_f32("TASKVAR_ARTIST_PX", ARTIST_PX)
+                .clamp(TEXT_PX_RANGE.0, TEXT_PX_RANGE.1),
         }
     }
 
@@ -387,7 +417,7 @@ impl ClawdLayout {
             .collect();
         // 既定は行高の 90%(4 行なら 18px)。行数を変えても行高に比例する。
         let name_px = env_f32("TASKVAR_CLAWD_PX", (row_h as f32 * 0.9).clamp(9.0, 20.0))
-            .clamp(6.0, row_h as f32);
+            .clamp(6.0, (row_h as f32).max(6.0));
         Some(Self { panel, rows, sprite_w, sprite_h, name_px })
     }
 }
@@ -424,10 +454,13 @@ pub enum Hit {
 pub struct Bar {
     pub w: u32,
     h: u32,
-    circle_d: u32,
-    /// 各アイコンタイルの左上 x(y はバー内で垂直センタリング)。
+    /// 白円の直径。
+    tile_d: u32,
+    /// 各アイコンの白円の左上 x(y は「白円 + 下線」の塊をバー内で垂直センタリング)。
     xs: Vec<u32>,
     tile_y: u32,
+    /// 下線の上端 y(白円の下端から `MARK_GAP` ぶん下)。
+    mark_y: u32,
     glyphs: Vec<Glyph>,
     ctrl: Vec<Glyph>,
     art_fallback: Glyph,
@@ -440,14 +473,20 @@ pub struct Bar {
 
 impl Bar {
     pub fn new(w: u32, h: u32) -> Result<Self> {
-        let circle_d = env_u32("TASKVAR_ICON_D", 64).clamp(16, h.saturating_sub(8).max(16));
         let gap = env_u32("TASKVAR_GAP", 24);
-        let n = ICONS.len() as u32;
-        let total = n * circle_d + (n - 1) * gap;
         // 左右端の余白は共通(左は clawd 枠、右は再生情報パネルが接する)。
         let margin = env_u32("TASKVAR_MARGIN", MARGIN);
-        let tile_y = (h - circle_d) / 2;
-        let glyph_px = circle_d * 58 / 100;
+        // アイコンの大きさは `TASKVAR_ICON_D`、無指定ならバー高さ `TASKVAR_BAR_H`
+        // (main.rs)から比で決まる。どちらもバーと左右の枠に収まるところで頭打ち。
+        let want_d = env_u32("TASKVAR_ICON_D", h * ICON_D_PCT / 100);
+        let tile_d = icon_d(w, h, want_d, gap, margin);
+        let n = ICONS.len() as u32;
+        let total = n * tile_d + (n - 1) * gap;
+        // 縦は「白円 + 余白 + 下線」をひと塊にして中央へ置く。
+        let block_h = tile_d + MARK_GAP + MARK_H;
+        let tile_y = h.saturating_sub(block_h) / 2;
+        let mark_y = tile_y + tile_d + MARK_GAP;
+        let glyph_px = (tile_d * ICON_GLYPH_PCT / 100).max(1);
         let glyphs = ICONS.iter().map(|d| icons::render(d.svg, glyph_px)).collect::<Result<_>>()?;
 
         // 左から clawd 枠・アイコン列・再生情報パネルの順。幅は
@@ -482,7 +521,7 @@ impl Bar {
         let icons_x = clawd.as_ref().map(|l| l.panel.x + l.panel.w + GAP).unwrap_or(margin);
         let icons_right = np.panel.x.saturating_sub(GAP);
         let x0 = icons_x + icons_right.saturating_sub(icons_x).saturating_sub(total) / 2;
-        let xs: Vec<u32> = (0..n).map(|i| x0 + i * (circle_d + gap)).collect();
+        let xs: Vec<u32> = (0..n).map(|i| x0 + i * (tile_d + gap)).collect();
 
         let sprite = match sprite::load() {
             Ok(s) => Some(s),
@@ -495,9 +534,10 @@ impl Bar {
         Ok(Self {
             w,
             h,
-            circle_d,
+            tile_d,
             xs,
             tile_y,
+            mark_y,
             glyphs,
             ctrl,
             art_fallback,
@@ -548,7 +588,7 @@ impl Bar {
             self.draw_shadow(buf, x0);
         }
         for (i, def) in ICONS.iter().enumerate() {
-            self.draw_tile(buf, self.xs[i], ring_color(def, state), &self.glyphs[i]);
+            self.draw_tile(buf, self.xs[i], mark(def, state), &self.glyphs[i]);
         }
         match np {
             Some(view) => self.draw_np(buf, view),
@@ -620,7 +660,7 @@ impl Bar {
     /// タイル 1 個ぶんの影。円をそのまま下へずらし、縁を `SHADOW_BLUR` かけて
     /// 滑らかに消す(内側は円が塗りつぶすので見えるのは外へはみ出したぶんだけ)。
     fn draw_shadow(&self, buf: &mut [u8], x0: u32) {
-        let r = self.circle_d as f32 / 2.0;
+        let r = self.tile_d as f32 / 2.0;
         let cx = x0 as f32 + r;
         let cy = self.tile_y as f32 + r + SHADOW_DY;
         let reach = r + SHADOW_BLUR;
@@ -638,43 +678,36 @@ impl Bar {
         }
     }
 
-    /// 白円 + リング + グリフを 1 タイルぶん描く。円境界は 1px の線形カバレッジで滑らかに。
-    fn draw_tile(&self, buf: &mut [u8], x0: u32, ring: Option<[u8; 3]>, glyph: &Glyph) {
-        let d = self.circle_d;
-        let r_out = d as f32 / 2.0;
-        let r_in = r_out - RING_W;
-        let c = d as f32 / 2.0;
-        let ring_c = ring.unwrap_or(BG);
+    /// アイコン 1 個ぶん(白円 → グリフ → 下線)。外枠リングは持たず、
+    /// 開いているかどうかは円の下の横線が示す。
+    fn draw_tile(&self, buf: &mut [u8], x0: u32, mark: Mark, glyph: &Glyph) {
+        let d = self.tile_d;
+        let r = d as f32 / 2.0;
         for j in 0..d {
             for i in 0..d {
-                let dx = i as f32 + 0.5 - c;
-                let dy = j as f32 + 0.5 - c;
-                let dist = (dx * dx + dy * dy).sqrt();
-                let cov_out = (r_out - dist + 0.5).clamp(0.0, 1.0);
-                let cov_in = (r_in - dist + 0.5).clamp(0.0, 1.0);
-                if cov_out <= 0.0 {
-                    continue; // タイル外周は下地(地色と影)のまま
-                }
-                let off = (((self.tile_y + j) * self.w + x0 + i) * 4) as usize;
-                let mut px = [0u8; 3];
-                for k in 0..3 {
-                    // 縁の半端なカバレッジは下地へ溶かす。下には影が敷いてあるので、
-                    // BG 固定にすると円のまわりだけ影が抜けて白く縁取られてしまう。
-                    let v = buf[off + k] as f32 * (1.0 - cov_out)
-                        + ring_c[k] as f32 * (cov_out - cov_in)
-                        + WHITE[k] as f32 * cov_in;
-                    px[k] = v.round() as u8;
-                }
-                buf[off..off + 3].copy_from_slice(&px);
-                buf[off + 3] = 0;
+                let (dx, dy) = (i as f32 + 0.5 - r, j as f32 + 0.5 - r);
+                // 円の縁は 1px の線形カバレッジで滑らかに。半端なぶんは地色ではなく
+                // **下地**(影)へ溶かす。地色固定にすると円のまわりだけ影が抜けて
+                // 白く縁取られてしまうため。
+                let cov = (r - (dx * dx + dy * dy).sqrt() + 0.5).clamp(0.0, 1.0);
+                blend(buf, self.w, self.h, x0 + i, self.tile_y + j, WHITE, cov);
             }
         }
-        premul_glyph(buf, self.w, x0 + (d - glyph.px) / 2, self.tile_y + (d - glyph.px) / 2, glyph);
+        let off = (d - glyph.px) / 2;
+        premul_glyph(buf, self.w, x0 + off, self.tile_y + off, glyph);
+
+        let Some(color) = mark.color() else { return };
+        let mw = (d * MARK_PCT / 100).max(MARK_H);
+        let rect = Rect { x: x0 + (d - mw) / 2, y: self.mark_y, w: mw, h: MARK_H };
+        round_rect(buf, self.w, self.h, rect, MARK_H as f32 / 2.0, color);
     }
 
     /// パネルの下地。枠線の角丸矩形の内側を 1px 詰めて塗る。
     fn draw_np_bg(&self, buf: &mut [u8], accent: Accent) {
         let p = self.np.panel;
+        if p.w < 3 || p.h < 3 {
+            return; // バーを極端に低く/アイコンを大きくしてパネルが潰れた
+        }
         round_rect_shadow(buf, self.w, self.h, p, 10.0);
         round_rect_grad(buf, self.w, self.h, p, 10.0, accent.edge, PANEL_EDGE);
         let inner = Rect { x: p.x + 1, y: p.y + 1, w: p.w - 2, h: p.h - 2 };
@@ -716,9 +749,14 @@ impl Bar {
             if max > 4.0 {
                 // 収まらないときはまず文字を縮めて入れる。下限まで縮めても
                 // 入らない場合だけ `…` で詰める。
-                let title_px = font.shrink_to_fit(&view.np.track, max, l.title_px, TITLE_MIN_PX);
-                let artist_px =
-                    font.shrink_to_fit(&view.np.artist, max, l.artist_px, ARTIST_MIN_PX);
+                let title_px =
+                    font.shrink_to_fit(&view.np.track, max, l.title_px, l.title_px * SHRINK_MIN_PCT);
+                let artist_px = font.shrink_to_fit(
+                    &view.np.artist,
+                    max,
+                    l.artist_px,
+                    l.artist_px * SHRINK_MIN_PCT,
+                );
 
                 let title = font.fit(&view.np.track, max, title_px);
                 let base1 = l.row1_y as f32 + l.row1_h as f32 / 2.0 + title_px * 0.35;
@@ -761,7 +799,8 @@ impl Bar {
                 // Spotify のプレイヤーバーに倣い、白い塗り円に黒いグリフ
                 circle(buf, self.w, self.h, x, y, d, WHITE);
                 let g = &self.ctrl[if p.playing { G_PAUSE } else { G_PLAY }];
-                let off = (d - g.px) / 2;
+                // 低いバーではボタンがグリフより小さくなりうる(グリフは最低 1px)
+                let off = d.saturating_sub(g.px) / 2;
                 tint_glyph(buf, self.w, self.h, x + off, y + off, g, BLACK);
                 return;
             }
@@ -795,13 +834,15 @@ impl Bar {
         if self.np.panel.contains(lx, ly) {
             return Some(Hit::Panel);
         }
-        // 円の少し外までタッチを許容する。
-        let r = self.circle_d as f64 / 2.0 + 8.0;
+        // 白円と下線をまとめて受け、その少し外までタッチを許容する。
         for (i, &x0) in self.xs.iter().enumerate() {
-            let cx = x0 as f64 + self.circle_d as f64 / 2.0;
-            let cy = self.tile_y as f64 + self.circle_d as f64 / 2.0;
-            let (dx, dy) = (lx - cx, ly - cy);
-            if dx * dx + dy * dy <= r * r {
+            let slot = Rect {
+                x: x0.saturating_sub(ICON_HIT_PAD),
+                y: self.tile_y.saturating_sub(ICON_HIT_PAD),
+                w: self.tile_d + ICON_HIT_PAD * 2,
+                h: (self.mark_y + MARK_H - self.tile_y) + ICON_HIT_PAD * 2,
+            };
+            if slot.contains(lx, ly) {
                 return Some(Hit::Icon(i));
             }
         }
@@ -989,20 +1030,53 @@ fn tint_glyph(buf: &mut [u8], w: u32, h: u32, x0: u32, y0: u32, glyph: &Glyph, c
     }
 }
 
-/// アイコンごとのリング色(バー描画とテストの両方から使う)。
-fn ring_color(def: &IconDef, state: &State) -> Option<[u8; 3]> {
+/// アイコン下の下線(バー描画とテストの両方から使う)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Mark {
+    /// 表示中のセッション。水色で、タイル幅いっぱいの長さ。
+    Active,
+    /// 開いているが表示していないセッション。灰色で短く。
+    Open,
+    /// セッションが無い。下線を引かない。
+    None,
+}
+
+impl Mark {
+    /// 下線の色。`None` なら引かない。長さは状態によらず `MARK_PCT`。
+    fn color(self) -> Option<[u8; 3]> {
+        match self {
+            Mark::Active => Some(BLUE),
+            Mark::Open => Some(GRAY),
+            Mark::None => Option::None,
+        }
+    }
+}
+
+/// 白円の直径を決める。`want` は `TASKVAR_ICON_D`(無指定ならバー高さ比)。
+/// 縦は「円 + 余白 + 下線」がバーに収まるところまで、横はアイコン列を並べても
+/// 左右の枠に `NP_MIN_W` ずつ残るところまでで頭打ちにする。
+fn icon_d(w: u32, h: u32, want: u32, gap: u32, margin: u32) -> u32 {
+    let n = ICONS.len() as u32;
+    let by_h = h.saturating_sub(MARK_GAP + MARK_H);
+    let room = w.saturating_sub(margin * 2 + GAP * 2 + NP_MIN_W * 2 + (n - 1) * gap);
+    want.min(by_h).min(room / n).max(ICON_D_MIN)
+}
+
+fn mark(def: &IconDef, state: &State) -> Mark {
     match def.session {
         Some(sess) => {
             if state.current.as_deref() == Some(sess) {
-                Some(BLUE)
+                Mark::Active
             } else if state.existing.iter().any(|s| s == sess) {
-                Some(GRAY)
+                Mark::Open
             } else {
-                None
+                Mark::None
             }
         }
-        // tmux アイコン: 名前付きセッション以外(=通常の作業セッション)を表示中なら青。
+        // tmux アイコン: 名前付きセッション以外(=通常の作業セッション)を表示中なら水色。
         // spotify はアイコン列に居ないが名前付きセッションではあるので数に入れる。
+        // tmux スイッチャーは閉じることが無いので、下線が消えることはない
+        // (名前付きセッションを見ている間は灰色になるだけ)。
         None => {
             let named: Vec<&str> = ICONS
                 .iter()
@@ -1010,8 +1084,8 @@ fn ring_color(def: &IconDef, state: &State) -> Option<[u8; 3]> {
                 .filter_map(|d| d.session)
                 .collect();
             match state.current.as_deref() {
-                Some(cur) if !named.contains(&cur) => Some(BLUE),
-                _ => None,
+                Some(cur) if !named.contains(&cur) => Mark::Active,
+                _ => Mark::Open,
             }
         }
     }
@@ -1043,19 +1117,96 @@ mod tests {
     }
 
     #[test]
-    fn ring_colors_follow_session_state() {
+    fn marks_follow_session_state() {
         // ICONS: [tmux, shorts, bluetooth, ssbrowse, eduroam, calendar]
         // (spotify は再生情報パネルが受け持つのでアイコン列には並べない)
         let st = state("bluetooth", &["bluetooth", "shorts"]);
-        assert_eq!(ring_color(&ICONS[2], &st), Some(BLUE), "表示中は青");
-        assert_eq!(ring_color(&ICONS[1], &st), Some(GRAY), "存在するが非表示は灰");
-        assert_eq!(ring_color(&ICONS[3], &st), None, "セッション無しは枠なし");
-        assert_eq!(ring_color(&ICONS[0], &st), None, "名前付きセッション表示中のtmuxは枠なし");
-        // spotify も名前付きセッション。アイコンが無くても tmux は枠なしのまま
+        assert_eq!(mark(&ICONS[2], &st), Mark::Active, "表示中は水色");
+        assert_eq!(mark(&ICONS[1], &st), Mark::Open, "存在するが非表示は灰色");
+        assert_eq!(mark(&ICONS[3], &st), Mark::None, "セッション無しは下線なし");
+        assert_eq!(mark(&ICONS[0], &st), Mark::Open, "名前付きセッション表示中のtmuxは灰色");
+        // spotify も名前付きセッション。アイコンが無くても tmux は灰色のまま
         let sp = state("spotify", &["spotify"]);
-        assert_eq!(ring_color(&ICONS[0], &sp), None, "spotify 表示中のtmuxは枠なし");
+        assert_eq!(mark(&ICONS[0], &sp), Mark::Open, "spotify 表示中のtmuxは灰色");
         let st2 = state("main", &["main", "spotify"]);
-        assert_eq!(ring_color(&ICONS[0], &st2), Some(BLUE), "通常セッション表示中のtmuxは青");
+        assert_eq!(mark(&ICONS[0], &st2), Mark::Active, "通常セッション表示中のtmuxは水色");
+        // tmux アイコンだけは、どの状態でも下線が消えない
+        for cur in ["main", "spotify", "bluetooth"] {
+            assert_ne!(mark(&ICONS[0], &state(cur, &[cur])), Mark::None, "tmux の下線が消えた");
+        }
+    }
+
+    /// 下線の帯の色。`x` はタイル中心からの相対位置(px)。
+    fn mark_px(buf: &[u8], bar: &Bar, i: usize, dx: i32) -> [u8; 3] {
+        let x = (bar.xs[i] + bar.tile_d / 2) as i32 + dx;
+        let off = ((bar.mark_y + MARK_H / 2) * bar.w + x as u32) as usize * 4;
+        [buf[off], buf[off + 1], buf[off + 2]]
+    }
+
+    #[test]
+    fn icon_size_follows_the_bar_height() {
+        // 無指定ならバー高さ比。既定の 88px バーでは従来どおり 64px
+        let want = |h: u32| h * ICON_D_PCT / 100;
+        assert_eq!(icon_d(1366, 88, want(88), 24, MARGIN), 64);
+        assert_eq!(icon_d(1366, 128, want(128), 24, MARGIN), 93, "バーを高くすると育つ");
+        assert_eq!(icon_d(1366, 48, want(48), 24, MARGIN), 35, "バーを低くすると縮む");
+
+        // 縦は「円 + 余白 + 下線」がバーに収まるところまで
+        for h in [24u32, 40, 88, 200] {
+            let d = icon_d(1366, h, 9999, 24, MARGIN);
+            assert!(d + MARK_GAP + MARK_H <= h, "h={h} で下線がバーからはみ出す");
+        }
+        // 横は、アイコン列を並べても左右の枠に NP_MIN_W ずつ残るところまで
+        let d = icon_d(1366, 400, 9999, 24, MARGIN);
+        let n = ICONS.len() as u32;
+        let total = n * d + (n - 1) * 24;
+        assert!(
+            total + MARGIN * 2 + GAP * 2 + NP_MIN_W * 2 <= 1366,
+            "アイコン列が枠の場所を食っている: total={total}"
+        );
+        // 下限は割り込まない(狭い画面でもアイコンは残す)
+        assert_eq!(icon_d(320, 88, want(88), 24, MARGIN), ICON_D_MIN);
+    }
+
+    #[test]
+    fn text_size_is_fixed_not_derived_from_the_bar() {
+        // バーの高さを変えても曲名・アーティストの大きさは動かない
+        for h in [40u32, 64, 96, 160] {
+            let l = NpLayout::new(1366, h, MARGIN, 400);
+            assert_eq!(l.title_px, TITLE_PX, "h={h} で曲名の大きさが変わった");
+            assert_eq!(l.artist_px, ARTIST_PX, "h={h} でアーティスト名の大きさが変わった");
+        }
+    }
+
+    #[test]
+    fn layout_survives_any_bar_height() {
+        // TASKVAR_BAR_H は 24px〜画面の半分まで動かせる(main.rs)。
+        // どの高さでも組み立てと描画が成立し、アイコン列が左右の枠と重ならない。
+        let w = 1366;
+        let heights = (24..=200).step_by(8).chain([256, 384]);
+        for h in heights {
+            let bar = Bar::new(w, h).unwrap();
+            let mut buf = vec![0u8; (w * h * 4) as usize];
+            let np = now_playing();
+            let view = NpView {
+                np: &np,
+                player: PlayerState { playing: true, shuffle: false, repeat: Loop::Off },
+                art: None,
+                accent: Accent::default(),
+            };
+            let rows = vec![Row { pane: "%1".into(), label: "main".into(), st: St::Run }];
+            let clawd = ClawdView { rows: &rows, phase: false };
+            bar.draw(&mut buf, &state("main", &["main"]), Some(&view), Some(&clawd));
+
+            // 白円 + 下線はバーの中に収まる
+            assert!(bar.mark_y + MARK_H <= h, "h={h} で下線がバーの外");
+            // アイコン列は左の clawd 枠と右のパネルに重ならない
+            let icons_right = bar.xs[ICONS.len() - 1] + bar.tile_d;
+            assert!(icons_right <= bar.np_rect().x, "h={h} でパネルに重なった");
+            if let Some(l) = &bar.clawd {
+                assert!(l.panel.x + l.panel.w <= bar.xs[0], "h={h} で clawd 枠に重なった");
+            }
+        }
     }
 
     /// `TASKVAR_TEST_ART` が指す画像を side x side の BGRA にして返す。
@@ -1074,7 +1225,8 @@ mod tests {
         let (w, h) = (1366u32, 96u32);
         let bar = Bar::new(w, h).unwrap();
         let mut buf = vec![0u8; (w * h * 4) as usize];
-        let st = state("shorts", &["shorts"]);
+        // shorts=表示中(水色) / bluetooth=開いているだけ(灰色) / 他=下線なし
+        let st = state("shorts", &["shorts", "bluetooth"]);
         let np = now_playing();
         // TASKVAR_TEST_ART=画像パス で実際のジャケットを流し込める
         // (アートから採る背景色を目視で確かめるため)。
@@ -1091,24 +1243,40 @@ mod tests {
             let off = ((y * w + x) * 4) as usize;
             [buf[off], buf[off + 1], buf[off + 2]]
         };
-        let (cx, cy) = (bar.xs[1] + bar.circle_d / 2, bar.tile_y + bar.circle_d / 2);
-        // 白円内・グリフ外の点は白(グリフはd*58%なので中心から±d*0.29まで)
-        assert_eq!(px(&buf, cx + bar.circle_d * 38 / 100, cy), WHITE);
-        // リング帯(半径 d/2 - RING_W/2 付近)は shorts=表示中 → 青
-        assert_eq!(px(&buf, cx + bar.circle_d / 2 - 2, cy), BLUE);
+        let (cx, cy) = (bar.xs[1] + bar.tile_d / 2, bar.tile_y + bar.tile_d / 2);
+        // 白円内・グリフ外の点は白(グリフは d*58% なので中心から ±d*0.29 まで)
+        assert_eq!(px(&buf, cx + bar.tile_d * 38 / 100, cy), WHITE);
+        // 外枠リングは持たない。円の縁まで白のまま
+        assert_eq!(px(&buf, cx + bar.tile_d / 2 - 2, cy), WHITE, "外枠リングが残っている");
+
+        // 下線の長さは状態によらず円の直径の半分。違うのは色だけ
+        let half = (bar.tile_d * MARK_PCT / 100 / 2) as i32;
+        // shorts=表示中 → 水色
+        assert_eq!(mark_px(&buf, &bar, 1, 0), BLUE, "表示中の下線が水色でない");
+        assert_eq!(mark_px(&buf, &bar, 1, half - 2), BLUE, "表示中の下線が短い");
+        assert_eq!(mark_px(&buf, &bar, 1, half + 2), BG, "表示中の下線が長い");
+        // bluetooth=開いているだけ → 同じ長さの灰色
+        assert_eq!(mark_px(&buf, &bar, 2, 0), GRAY, "非表示セッションの下線が灰色でない");
+        assert_eq!(mark_px(&buf, &bar, 2, half - 2), GRAY, "灰色の下線が短い");
+        assert_eq!(mark_px(&buf, &bar, 2, half + 2), BG, "灰色の下線が長い");
+        // ssbrowse=セッション無し → 下線なし(円の影が届く場所なので地色より暗い)
+        let none = mark_px(&buf, &bar, 3, 0);
+        assert!(none != BLUE && none != GRAY, "セッション無しに下線が出ている: {none:?}");
+        // tmux は名前付きセッション(shorts)を表示中なので灰色。消えることはない
+        assert_eq!(mark_px(&buf, &bar, 0, 0), GRAY, "tmux の下線が消えている");
 
         // アイコン列は clawd 枠とパネルの間の中央。左右の余りが揃っている
-        let icons_right = bar.xs[ICONS.len() - 1] + bar.circle_d;
+        let icons_right = bar.xs[ICONS.len() - 1] + bar.tile_d;
         let l = bar.clawd.as_ref().unwrap();
         let left_gap = bar.xs[0] - (l.panel.x + l.panel.w);
         let right_gap = bar.np_rect().x - icons_right;
         assert!(left_gap.abs_diff(right_gap) <= 1, "中央でない: 左 {left_gap} / 右 {right_gap}");
-        // 円から離れた場所は素通しの地色(影はぼかし幅ぶんしか届かない)
+        // アイコン列から離れた場所は素通しの地色
         assert_eq!(px(&buf, icons_right + 4, 2), BG);
         assert_eq!(px(&buf, l.panel.x + l.panel.w + 4, 2), BG);
-
         // 円の真下には影。地色より暗く、下へ離れるほど薄くなって地色へ戻る
-        let below = |dy: u32| px(&buf, cx, bar.tile_y + bar.circle_d + dy);
+        // (下線は円の下端から MARK_GAP 空くので、そこまでは影だけが見える)
+        let below = |dy: u32| px(&buf, cx, bar.tile_y + bar.tile_d + dy);
         let near = below(1);
         assert!(near.iter().zip(BG).all(|(a, b)| *a < b), "円の下に影が無い: {near:?}");
         let far = below(SHADOW_BLUR as u32 + SHADOW_DY as u32);
@@ -1261,7 +1429,7 @@ mod tests {
         assert_eq!(l.panel.y, np.y, "上の余白が違う");
         assert_eq!(l.panel.h, np.h, "高さが違う");
         assert!(l.panel.x + l.panel.w <= bar.xs[0], "アイコン列に重なっている");
-        let icons_right = bar.xs[ICONS.len() - 1] + bar.circle_d;
+        let icons_right = bar.xs[ICONS.len() - 1] + bar.tile_d;
         assert!(icons_right <= bar.np_rect().x, "アイコン列が再生情報パネルに重なっている");
         assert_eq!(bar.clawd_rect(), Some(l.panel));
 
