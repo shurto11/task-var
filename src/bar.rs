@@ -132,16 +132,23 @@ const SHRINK_MIN_PCT: f32 = 0.75;
 const PLAY_GLYPH_PCT: u32 = 58;
 
 // clawd 枠(動いている Claude Code の一覧)。
-/// 縦に並べる最大行数。`TASKVAR_CLAWD_ROWS` で変えられる。
-const CLAWD_ROWS: usize = 4;
+/// 縦に並べる行数。`TASKVAR_CLAWD_ROWS` で変えられる。
+const CLAWD_ROWS: usize = 2;
+/// 横に並べる列数。`TASKVAR_CLAWD_COLS` で変えられる。
+/// 既定は 2 行 2 列で、最大 4 個を 2x2 に並べる。
+const CLAWD_COLS: usize = 2;
 const CLAWD_PAD_X: u32 = 8;
 const CLAWD_PAD_Y: u32 = 4;
 /// 行間(キャラの上下に食わせる余白)。
 const CLAWD_ROW_GAP: u32 = 2;
+/// 列間(隣のセルの見出しと詰まって見えないよう、キャラ間隔より広く取る)。
+const CLAWD_COL_GAP: u32 = 12;
 /// キャラとセッション名の間隔。
 const CLAWD_NAME_GAP: u32 = 8;
-/// 見出しを縮められる下限。ここまで縮めても入らなければ `…` で詰める。
-const CLAWD_NAME_MIN_PX: f32 = 8.0;
+/// 見出しの文字サイズ。`TASKVAR_CLAWD_PX` で変えられる。
+/// 行の高さからは決めず、幅に入らなくても縮めない(セルごとに大きさが
+/// 変わると 2x2 の格子がばらついて見えるため)。溢れた分は `…` で詰める。
+const CLAWD_NAME_PX: f32 = 20.0;
 /// これより狭い場所しか空いていなければ枠ごと出さない。
 const CLAWD_MIN_W: u32 = 96;
 /// 走りアニメーションの上下動(px)。行が低いので touch-claude の 5px より小さい。
@@ -378,17 +385,23 @@ impl NpLayout {
 /// clawd 枠の位置(バーローカル座標)。
 struct ClawdLayout {
     panel: Rect,
-    /// 上から順の行矩形(枠の内側)。当たり判定もこれで行う。
-    rows: Vec<Rect>,
-    /// キャラの大きさ(全行共通)。
+    /// 1 個ぶんの区画(枠の内側)。左上から列優先(上→下、左→右)に並ぶ。
+    /// 先に左の列が埋まるので、2 個までなら右の列は空いたままになる。
+    /// 当たり判定もこれで行う。
+    cells: Vec<Rect>,
+    /// 1 列に並ぶ数(= 行数)。`i + grid_rows` が右隣の列の同じ段になるので、
+    /// 「右の列が空いているか」の判定に使う。
+    grid_rows: usize,
+    /// キャラの大きさ(全セル共通)。
     sprite_w: u32,
     sprite_h: u32,
     name_px: f32,
 }
 
 impl ClawdLayout {
-    /// バーの左端 x に幅 want で置く(want は再生情報パネルと同じ幅)。
-    /// 幅が足りなければ None(枠ごと出さない)。
+    /// バーの左端 x に幅 want で置き、中を rows x cols の格子に割る
+    /// (want は再生情報パネルと同じ幅)。1 セルの幅が足りなければ
+    /// None(枠ごと出さない)。
     ///
     /// パネルの有無で幅を変えたりはしない。曲が止まって再生情報が消えるたびに
     /// 枠が伸び縮みすると、タップ先が動いて押し間違えるため。
@@ -398,28 +411,38 @@ impl ClawdLayout {
             return None;
         }
         let panel = Rect { x, y: INSET, w: panel_w, h: h.saturating_sub(INSET * 2) };
-        let n = env_u32("TASKVAR_CLAWD_ROWS", CLAWD_ROWS as u32).clamp(1, 8) as usize;
+        let rows = env_u32("TASKVAR_CLAWD_ROWS", CLAWD_ROWS as u32).clamp(1, 8) as usize;
+        let cols = env_u32("TASKVAR_CLAWD_COLS", CLAWD_COLS as u32).clamp(1, 4) as usize;
         let content_h = panel.h.saturating_sub(CLAWD_PAD_Y * 2);
-        let row_h = content_h / n as u32;
+        let row_h = content_h / rows as u32;
         if row_h <= CLAWD_ROW_GAP {
             return None;
         }
         let sprite_h = row_h - CLAWD_ROW_GAP;
         let sprite_w = sprite_h * sprite::ASPECT.0 / sprite::ASPECT.1;
-        let row_w = panel.w.saturating_sub(CLAWD_PAD_X * 2);
+        let content_w = panel.w.saturating_sub(CLAWD_PAD_X * 2);
+        let gaps = CLAWD_COL_GAP * (cols as u32 - 1);
+        let col_w = content_w.saturating_sub(gaps) / cols as u32;
         // キャラだけで埋まってしまうならセッション名が出せないので諦める
-        if row_w <= sprite_w + CLAWD_NAME_GAP {
+        if col_w <= sprite_w + CLAWD_NAME_GAP {
             return None;
         }
         // 行は枠の縦中央に固める(端数は上下へ均等に散らす)
-        let top = panel.y + (panel.h - row_h * n as u32) / 2;
-        let rows = (0..n)
-            .map(|i| Rect { x: panel.x + CLAWD_PAD_X, y: top + i as u32 * row_h, w: row_w, h: row_h })
+        let top = panel.y + (panel.h - row_h * rows as u32) / 2;
+        let left = panel.x + CLAWD_PAD_X;
+        // 左の列から縦に埋める。少ないうちは右の列が空くので、そこを
+        // 見出しの場所へ回せる(`draw_clawd`)
+        let cells = (0..rows * cols)
+            .map(|i| Rect {
+                x: left + (i / rows) as u32 * (col_w + CLAWD_COL_GAP),
+                y: top + (i % rows) as u32 * row_h,
+                w: col_w,
+                h: row_h,
+            })
             .collect();
-        // 既定は行高の 90%(4 行なら 18px)。行数を変えても行高に比例する。
-        let name_px = env_f32("TASKVAR_CLAWD_PX", (row_h as f32 * 0.9).clamp(9.0, 20.0))
-            .clamp(6.0, (row_h as f32).max(6.0));
-        Some(Self { panel, rows, sprite_w, sprite_h, name_px })
+        // 見出しは 20px 固定。行高や行数には連動させない。
+        let name_px = env_f32("TASKVAR_CLAWD_PX", CLAWD_NAME_PX).max(6.0);
+        Some(Self { panel, cells, grid_rows: rows, sprite_w, sprite_h, name_px })
     }
 }
 
@@ -549,10 +572,11 @@ impl Bar {
         })
     }
 
-    /// clawd 枠に並べられる行数。0 なら枠を出せない(場所が無い/画像が無い)。
-    pub fn clawd_rows(&self) -> usize {
+    /// clawd 枠に並べられる個数(行数 x 列数)。
+    /// 0 なら枠を出せない(場所が無い/画像が無い)。
+    pub fn clawd_cells(&self) -> usize {
         match (&self.clawd, &self.sprite) {
-            (Some(l), Some(_)) => l.rows.len(),
+            (Some(l), Some(_)) => l.cells.len(),
             _ => 0,
         }
     }
@@ -602,7 +626,7 @@ impl Bar {
         }
     }
 
-    /// clawd 枠を描く。行が 1 つも無くても枠だけは描く
+    /// clawd 枠を描く。1 つも無くても場所だけは空けておく
     /// (claude が動いていない間もバーの形を変えないため)。
     fn draw_clawd(&self, buf: &mut [u8], view: &ClawdView) {
         let Some(l) = &self.clawd else { return };
@@ -612,7 +636,7 @@ impl Bar {
         // ので、claude が居ても居なくてもタップ先はずれない。
         let Some(sprite) = &self.sprite else { return };
 
-        for (row, r) in view.rows.iter().zip(l.rows.iter()) {
+        for (i, (row, r)) in view.rows.iter().zip(l.cells.iter()).enumerate() {
             let body = match row.st {
                 St::Run => sprite.body,
                 St::Ask => CLAWD_ASK,
@@ -646,11 +670,19 @@ impl Bar {
             // 確認済み(灰)は文字も落として控えめにする。
             let Some(font) = &self.font else { continue };
             let tx = r.x + l.sprite_w + CLAWD_NAME_GAP;
-            let max = (r.x + r.w).saturating_sub(tx) as f32;
+            // 右隣の列にキャラが居ないなら、見出しはそこも使って枠の右端で切る
+            // (2 個までは左の列だけが埋まるので、そのときは枠いっぱいに出る)
+            let right = if i + l.grid_rows >= view.rows.len() {
+                l.panel.x + l.panel.w - CLAWD_PAD_X
+            } else {
+                r.x + r.w
+            };
+            let max = right.saturating_sub(tx) as f32;
             if max <= 4.0 {
                 continue;
             }
-            let px = font.shrink_to_fit(&row.label, max, l.name_px, CLAWD_NAME_MIN_PX);
+            // 幅に入らなくても文字は縮めない。入るところまで出して `…` で詰める
+            let px = l.name_px;
             let text = font.fit(&row.label, max, px);
             let color = if row.st == St::Seen { CLAWD_NAME_SEEN } else { CLAWD_NAME };
             let base = r.y as f32 + r.h as f32 / 2.0 + px * 0.35;
@@ -813,11 +845,11 @@ impl Bar {
 
     /// バーローカル座標 (lx,ly) が何に当たるか。`ctrls_shown` が false のときは
     /// 操作ボタンを描いていない(spotatui が居ない)ので、パネル内はどこを
-    /// 押しても遷移になる。`clawd_rows` は
-    /// いま描いている clawd の行数(描いていない行は当たらない)。
-    pub fn hit(&self, lx: f64, ly: f64, ctrls_shown: bool, clawd_rows: usize) -> Option<Hit> {
+    /// 押しても遷移になる。`clawd_cells` は
+    /// いま描いている clawd の個数(描いていないセルは当たらない)。
+    pub fn hit(&self, lx: f64, ly: f64, ctrls_shown: bool, clawd_cells: usize) -> Option<Hit> {
         if let Some(l) = &self.clawd {
-            for (i, r) in l.rows.iter().take(clawd_rows).enumerate() {
+            for (i, r) in l.cells.iter().take(clawd_cells).enumerate() {
                 if r.contains(lx, ly) {
                     return Some(Hit::Clawd(i));
                 }
@@ -1424,7 +1456,7 @@ mod tests {
     #[test]
     fn clawd_frame_sits_left_of_the_icons() {
         let bar = Bar::new(1366, 96).unwrap();
-        assert_eq!(bar.clawd_rows(), CLAWD_ROWS, "既定は 4 行");
+        assert_eq!(bar.clawd_cells(), CLAWD_ROWS * CLAWD_COLS, "既定は 2 行 2 列");
         let l = bar.clawd.as_ref().unwrap();
 
         // 左から clawd 枠・アイコン列・再生情報パネルの順に並ぶ
@@ -1439,17 +1471,29 @@ mod tests {
         assert!(icons_right <= bar.np_rect().x, "アイコン列が再生情報パネルに重なっている");
         assert_eq!(bar.clawd_rect(), Some(l.panel));
 
-        // 行はすべて枠の内側。上下の余りは均等に散る
-        for (i, r) in l.rows.iter().enumerate() {
-            assert!(r.y >= l.panel.y && r.y + r.h <= l.panel.y + l.panel.h, "行 {i} が縦にはみ出す");
-            assert!(r.x >= l.panel.x && r.x + r.w <= l.panel.x + l.panel.w, "行 {i} が横にはみ出す");
-            assert!(l.sprite_w + CLAWD_NAME_GAP < r.w, "行 {i} に見出しの場所が無い");
+        // セルはすべて枠の内側。上下の余りは均等に散る
+        for (i, r) in l.cells.iter().enumerate() {
+            assert!(r.y >= l.panel.y && r.y + r.h <= l.panel.y + l.panel.h, "{i} が縦にはみ出す");
+            assert!(r.x >= l.panel.x && r.x + r.w <= l.panel.x + l.panel.w, "{i} が横にはみ出す");
+            assert!(l.sprite_w + CLAWD_NAME_GAP < r.w, "{i} に見出しの場所が無い");
         }
-        // 既定の見出しは 18px(行高 20px の 90%)
-        assert_eq!(l.name_px, 18.0, "既定の文字サイズが変わっている");
+        // 左上 → 左下 → 右上 → 右下 の順(左の列から縦に埋める)
+        assert_eq!(l.cells[0].x, l.cells[1].x, "1 列目の x が揃っていない");
+        assert_eq!(l.cells[1].y, l.cells[0].y + l.cells[0].h, "2 個目が真下に来ていない");
+        assert_eq!(l.cells[0].y, l.cells[CLAWD_ROWS].y, "1 行目の高さが揃っていない");
+        assert_eq!(
+            l.cells[CLAWD_ROWS].x - (l.cells[0].x + l.cells[0].w),
+            CLAWD_COL_GAP,
+            "列間が CLAWD_COL_GAP になっていない"
+        );
 
-        let above = l.rows[0].y - l.panel.y;
-        let below = (l.panel.y + l.panel.h) - (l.rows[CLAWD_ROWS - 1].y + l.rows[0].h);
+        // 見出しは 20px 固定(行高にも行数にも連動しない)
+        assert_eq!(l.name_px, CLAWD_NAME_PX, "既定の文字サイズが変わっている");
+        assert_eq!(ClawdLayout::new(64, 12, 400).unwrap().name_px, CLAWD_NAME_PX, "バーが低くても同じ");
+
+        let above = l.cells[0].y - l.panel.y;
+        let last = l.cells[CLAWD_ROWS - 1]; // 1 列目の一番下
+        let below = (l.panel.y + l.panel.h) - (last.y + last.h);
         assert!(above.abs_diff(below) <= 1, "上下の余白が揃っていない: 上 {above} / 下 {below}");
 
         // 左右の余りが揃う(枠とパネルが同じ幅で、アイコン列が中央にあるため)
@@ -1462,7 +1506,7 @@ mod tests {
     }
 
     #[test]
-    fn clawd_rows_draw_and_hit() {
+    fn clawd_cells_draw_and_hit() {
         let (w, h) = (1366u32, 96u32);
         let bar = Bar::new(w, h).unwrap();
         let mut buf = vec![0u8; (w * h * 4) as usize];
@@ -1488,11 +1532,11 @@ mod tests {
         let has = |buf: &[u8], r: Rect, c: [u8; 3]| {
             (0..l.sprite_w).any(|i| (0..r.h).any(|j| px(buf, r.x + i, r.y + j) == c))
         };
-        let r0 = l.rows[0];
-        assert!(has(&buf, l.rows[0], sprite.body), "処理中の行が元のオレンジで描かれていない");
-        assert!(has(&buf, l.rows[1], CLAWD_DONE), "終了の行が黄で描かれていない");
-        // 描いていない 3 行目は地色のまま
-        assert!(!has(&buf, l.rows[2], sprite.body) && !has(&buf, l.rows[2], CLAWD_DONE));
+        let r0 = l.cells[0];
+        assert!(has(&buf, l.cells[0], sprite.body), "処理中のキャラが元のオレンジで描かれていない");
+        assert!(has(&buf, l.cells[1], CLAWD_DONE), "終了のキャラが黄で描かれていない");
+        // 描いていない 3 つ目(2 段目の左)は地色のまま
+        assert!(!has(&buf, l.cells[2], sprite.body) && !has(&buf, l.cells[2], CLAWD_DONE));
 
         // キャラの右下には薄い影(地色より暗いが、キャラ本体ほど濃くない)
         let shaded = (0..l.sprite_w + CLAWD_SHADOW_DX).any(|i| {
@@ -1504,32 +1548,82 @@ mod tests {
         assert!(shaded, "キャラの影が描かれていない");
 
         // 見出しはキャラの右に黒で出る(地色でないピクセルがある)
-        let r = l.rows[0];
+        let r = l.cells[0];
         let name_x = r.x + l.sprite_w + CLAWD_NAME_GAP;
         assert!(
             (name_x..r.x + r.w).any(|x| (r.y..r.y + r.h).any(|y| px(&buf, x, y) != BG)),
             "見出しが描かれていない(フォントが無い環境かもしれない)"
         );
 
-        // 当たり判定: 描いた 2 行だけが当たる
+        // 当たり判定: 描いた 2 つだけが当たる(0 = 左上、1 = 右上)
         let center = |r: Rect| ((r.x + r.w / 2) as f64, (r.y + r.h / 2) as f64);
-        let (x0, y0) = center(l.rows[0]);
+        let (x0, y0) = center(l.cells[0]);
         assert_eq!(bar.hit(x0, y0, false, rows.len()), Some(Hit::Clawd(0)));
-        let (x1, y1) = center(l.rows[1]);
+        let (x1, y1) = center(l.cells[1]);
         assert_eq!(bar.hit(x1, y1, false, rows.len()), Some(Hit::Clawd(1)));
-        let (x2, y2) = center(l.rows[2]);
-        assert_eq!(bar.hit(x2, y2, false, rows.len()), None, "描いていない行は当たらない");
+        let (x2, y2) = center(l.cells[2]);
+        assert_eq!(bar.hit(x2, y2, false, rows.len()), None, "描いていないセルは当たらない");
         assert_eq!(bar.hit(x0, y0, false, 0), None, "枠が空なら当たらない");
 
-        // 行が無ければ場所ごと地色のまま(枠を持たないので何も残らない)。
+        // 1 つも無ければ場所ごと地色のまま(枠を持たないので何も残らない)。
         // 場所は `ClawdLayout` が確保したままなのでタップ先はずれない
         let mut empty = vec![0u8; (w * h * 4) as usize];
         bar.draw(&mut empty, &st, None, Some(&ClawdView { rows: &[], phase: false }));
         assert!(
             (l.panel.x..l.panel.x + l.panel.w)
                 .all(|x| (l.panel.y..l.panel.y + l.panel.h).all(|y| px(&empty, x, y) == BG)),
-            "行が無いのに何か描かれている"
+            "1 つも無いのに何か描かれている"
         );
+    }
+
+    #[test]
+    fn the_label_takes_the_empty_column_next_to_it() {
+        let (w, h) = (1366u32, 96u32);
+        let bar = Bar::new(w, h).unwrap();
+        let l = bar.clawd.as_ref().unwrap();
+        let st = state("main", &["main"]);
+        // 1 セルの幅には到底入らない見出し
+        let row = |i: usize, s: St| Row {
+            pane: format!("%{i}"),
+            label: "task-var の clawd 枠を 2 行 2 列に並べ替える".into(),
+            st: s,
+        };
+        let draw = |rows: &[Row]| {
+            let mut buf = vec![0u8; (w * h * 4) as usize];
+            bar.draw(&mut buf, &st, None, Some(&ClawdView { rows, phase: false }));
+            buf
+        };
+        // その段(セルの高さ)の x0..x1 に何か描かれているか
+        let ink = |buf: &[u8], x0: u32, x1: u32, cell: Rect| {
+            (x0..x1).any(|x| {
+                (cell.y..cell.y + cell.h).any(|y| {
+                    let off = ((y * w + x) * 4) as usize;
+                    [buf[off], buf[off + 1], buf[off + 2]] != BG
+                })
+            })
+        };
+        // 列の境(列間の隙間)と、右の列で見出しが来る辺り
+        let (top, bottom) = (l.cells[0], l.cells[1]);
+        let (gap_x0, gap_x1) = (top.x + top.w, l.cells[CLAWD_ROWS].x);
+        let right_text = l.cells[CLAWD_ROWS].x + l.sprite_w + CLAWD_NAME_GAP;
+        let right_end = l.panel.x + l.panel.w - CLAWD_PAD_X;
+
+        // 2 個までは右の列が空くので、見出しはそこも使って枠の右端で切る
+        let two = draw(&[row(1, St::Run), row(2, St::Done)]);
+        assert!(ink(&two, gap_x0, gap_x1, top), "列の境で切れている(見出しが伸びていない)");
+        assert!(ink(&two, right_text, right_end, top), "右の列まで届いていない");
+        assert!(ink(&two, right_text, right_end, bottom), "下の段が伸びていない");
+
+        // 右上にキャラが入ったら、その段の見出しは自分のセルの中で `…` に詰める。
+        // 右下はまだ空なので、下の段は伸びたまま
+        let three = draw(&[row(1, St::Run), row(2, St::Done), row(3, St::Ask)]);
+        assert!(!ink(&three, gap_x0, gap_x1, top), "右の列が埋まったのに見出しがはみ出している");
+        assert!(ink(&three, right_text, right_end, bottom), "空いている右下まで伸びていない");
+
+        // 4 個そろえば、どの段も自分のセルの中で切れる
+        let four = draw(&[row(1, St::Run), row(2, St::Done), row(3, St::Ask), row(4, St::Seen)]);
+        assert!(!ink(&four, gap_x0, gap_x1, top), "上の段がはみ出している");
+        assert!(!ink(&four, gap_x0, gap_x1, bottom), "下の段がはみ出している");
     }
 
     #[test]

@@ -152,7 +152,7 @@ fn redraw(
     phase: bool,
 ) -> (bool, Vec<Row>) {
     let view = np.view();
-    let rows = clawd.lock().unwrap().rows(bar.clawd_rows());
+    let rows = clawd.lock().unwrap().rows(bar.clawd_cells());
     bar.draw(buf, state, view.as_ref(), Some(&ClawdView { rows: &rows, phase }));
     (view.is_some(), rows)
 }
