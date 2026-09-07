@@ -3,7 +3,8 @@
 //! バーは画面下部の全幅の帯(BGRA バッファ)。左に clawd 枠、中央にセッション切替の
 //! 白円アイコンを横一列(外枠リングは持たない)、右に Spotify の再生情報パネルを置く。
 //! 白円の下の下線: 表示中セッション=水色 / 存在するが非表示=灰色 /
-//! セッション無し=下線なし。長さは同じで、違うのは色だけ。
+//! セッション無し=下線なし。灰色は水色の半分の長さにして、色だけでなく
+//! 長さでも見分けが付くようにする。
 //! tmux アイコンはセッションに対応せず閉じることが無いので、下線が消えることはない
 //! (名前付きセッション以外を表示中=水色、名前付きセッションを見ている間=灰色)。
 //!
@@ -40,8 +41,10 @@ const GRAY: [u8; 3] = [128, 128, 128];
 const MARK_H: u32 = 4;
 /// グリフの下端と下線の間隔(px)。
 const MARK_GAP: u32 = 4;
-/// 下線の長さ。タイル幅に対する割合(水色・灰色とも同じで、違うのは色だけ)。
+/// 水色(表示中)の下線の長さ。タイル幅に対する割合。
 const MARK_PCT: u32 = 50;
+/// 灰色(開いているだけ)の下線の長さ。水色の半分。
+const MARK_OPEN_PCT: u32 = MARK_PCT / 2;
 /// 円の外側どこまでをアイコンのタッチとして拾うか(px)。
 const ICON_HIT_PAD: u32 = 8;
 /// グリフの大きさ。白円の直径に対する割合。
@@ -58,10 +61,12 @@ const NP_MIN_W: u32 = 200;
 // 影。明るい地色の上でアイコンの白円と 2 つの枠が浮いて見えるように真下へ敷く。
 /// 影の色(#1E2D5A 相当)。地色が青みなので黒ではなく暗い青にする。
 const SHADOW: [u8; 3] = [0x5A, 0x2D, 0x1E];
-/// 円(枠は縁)の真下での影の濃さ。ここからぼかし幅ぶんかけて 0 へ落とす。
-const SHADOW_A: f32 = 0.30;
-/// 影のぼかし幅(px)。円や枠の外側へこのぶん広がる。
-const SHADOW_BLUR: f32 = 7.0;
+/// 円(枠は縁)の真下での影の濃さの既定。ここからぼかし幅ぶんかけて 0 へ落とす。
+/// `TASKVAR_SHADOW_A` で変えられる(→ `shadow_a()`)。
+const SHADOW_A: f32 = 0.05;
+/// 影のぼかし幅(px)の既定。円や枠の外側へこのぶん広がる。
+/// `TASKVAR_SHADOW_BLUR` で変えられる(→ `shadow_blur()`)。
+const SHADOW_BLUR: f32 = 2.0;
 /// 影を下へずらす量(px)。光が上から当たっているように見せる。
 const SHADOW_DY: f32 = 3.0;
 
@@ -159,8 +164,10 @@ pub const CLAWD_BOB_MS: u128 = 300;
 const CLAWD_NAME: [u8; 3] = [0x1A, 0x1A, 0x14]; // #141A1A
 /// 確認済み(灰)の行の見出し。黒より落として控えめにする。
 const CLAWD_NAME_SEEN: [u8; 3] = [0x8C, 0x82, 0x78]; // #78828C
-/// キャラの影の濃さ。円や枠(`SHADOW_A`)より薄くする。
-const CLAWD_SHADOW_A: f32 = 0.18;
+/// キャラの影の濃さ。円や枠(`shadow_a()`)に対する比で持つので、
+/// `TASKVAR_SHADOW_A` を動かすとキャラの影も一緒に付いてくる。
+/// 18px のキャラに同じ濃さを敷くと影の方が目立つため薄くする。
+const CLAWD_SHADOW_RATIO: f32 = 0.6;
 /// キャラの影のずらし量(px)。キャラが小さいので円より小さく。
 const CLAWD_SHADOW_DX: u32 = 1;
 const CLAWD_SHADOW_DY: u32 = 2;
@@ -182,6 +189,36 @@ fn env_opt_u32(name: &str) -> Option<u32> {
 /// 上下のずらし量。負値も取れる。
 fn env_i32(name: &str, default: i32) -> i32 {
     std::env::var(name).ok().and_then(|v| v.trim().parse().ok()).unwrap_or(default)
+}
+
+/// 影の濃さ(`TASKVAR_SHADOW_A`)。描画のたびに env を引かないよう 1 度だけ読む。
+fn shadow_a() -> f32 {
+    static V: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
+    *V.get_or_init(|| shadow_a_of(std::env::var("TASKVAR_SHADOW_A").ok().as_deref()))
+}
+
+/// 影のぼかし幅(`TASKVAR_SHADOW_BLUR`, px)。同じく 1 度だけ読む。
+fn shadow_blur() -> f32 {
+    static V: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
+    *V.get_or_init(|| shadow_blur_of(std::env::var("TASKVAR_SHADOW_BLUR").ok().as_deref()))
+}
+
+/// 濃さの値決め。0(影を完全に消す)も有効なので `env_f32` は使えない。
+/// 1 より上は不透明を超えるだけなので頭打ちにする。
+fn shadow_a_of(v: Option<&str>) -> f32 {
+    v.and_then(|v| v.trim().parse::<f32>().ok())
+        .filter(|v| *v >= 0.0)
+        .unwrap_or(SHADOW_A)
+        .min(1.0)
+}
+
+/// ぼかし幅の値決め。0 だと落とし込みの割り算が 0 除算になるので下限を持ち、
+/// 上は画面を覆い尽くさないところで止める。
+fn shadow_blur_of(v: Option<&str>) -> f32 {
+    v.and_then(|v| v.trim().parse::<f32>().ok())
+        .filter(|v| v.is_finite())
+        .unwrap_or(SHADOW_BLUR)
+        .clamp(0.5, 64.0)
 }
 
 /// 文字サイズ用。0 以下や解析できない値は既定へ落とす。
@@ -662,7 +699,7 @@ impl Bar {
                 l.sprite_w,
                 sh,
                 &shade,
-                CLAWD_SHADOW_A,
+                shadow_a() * CLAWD_SHADOW_RATIO,
             );
             blit_alpha(buf, self.w, self.h, r.x, sy, l.sprite_w, sh, &bgra);
 
@@ -696,7 +733,7 @@ impl Bar {
         let r = self.tile_d as f32 / 2.0;
         let cx = x0 as f32 + r;
         let cy = self.tile_y as f32 + r + SHADOW_DY;
-        let reach = r + SHADOW_BLUR;
+        let reach = r + shadow_blur();
         let x_min = (cx - reach).floor().max(0.0) as u32;
         let y_min = (cy - reach).floor().max(0.0) as u32;
         let x_max = ((cx + reach).ceil() as u32).min(self.w.saturating_sub(1));
@@ -704,9 +741,9 @@ impl Bar {
         for y in y_min..=y_max {
             for x in x_min..=x_max {
                 let (dx, dy) = (x as f32 + 0.5 - cx, y as f32 + 0.5 - cy);
-                let t = ((reach - (dx * dx + dy * dy).sqrt()) / SHADOW_BLUR).clamp(0.0, 1.0);
+                let t = ((reach - (dx * dx + dy * dy).sqrt()) / shadow_blur()).clamp(0.0, 1.0);
                 // 線形のままだと縁が輪郭に見えるので smoothstep で落とす
-                blend(buf, self.w, self.h, x, y, SHADOW, t * t * (3.0 - 2.0 * t) * SHADOW_A);
+                blend(buf, self.w, self.h, x, y, SHADOW, t * t * (3.0 - 2.0 * t) * shadow_a());
             }
         }
     }
@@ -729,8 +766,8 @@ impl Bar {
         let off = (d - glyph.px) / 2;
         premul_glyph(buf, self.w, x0 + off, self.tile_y + off, glyph);
 
-        let Some(color) = mark.color() else { return };
-        let mw = (d * MARK_PCT / 100).max(MARK_H);
+        let Some((color, pct)) = mark.style() else { return };
+        let mw = (d * pct / 100).max(MARK_H);
         let rect = Rect { x: x0 + (d - mw) / 2, y: self.mark_y, w: mw, h: MARK_H };
         round_rect(buf, self.w, self.h, rect, MARK_H as f32 / 2.0, color);
     }
@@ -943,10 +980,10 @@ fn round_rect_shadow(buf: &mut [u8], w: u32, h: u32, rect: Rect, r: f32) {
         rect.y as f32 + rect.h as f32 / 2.0 + SHADOW_DY,
     );
     let (hx, hy) = (rect.w as f32 / 2.0, rect.h as f32 / 2.0);
-    let x0 = (cx - hx - SHADOW_BLUR).floor().max(0.0) as u32;
-    let y0 = (cy - hy - SHADOW_BLUR).floor().max(0.0) as u32;
-    let x1 = ((cx + hx + SHADOW_BLUR).ceil() as u32).min(w.saturating_sub(1));
-    let y1 = ((cy + hy + SHADOW_BLUR).ceil() as u32).min(h.saturating_sub(1));
+    let x0 = (cx - hx - shadow_blur()).floor().max(0.0) as u32;
+    let y0 = (cy - hy - shadow_blur()).floor().max(0.0) as u32;
+    let x1 = ((cx + hx + shadow_blur()).ceil() as u32).min(w.saturating_sub(1));
+    let y1 = ((cy + hy + shadow_blur()).ceil() as u32).min(h.saturating_sub(1));
     for y in y0..=y1 {
         for x in x0..=x1 {
             let dx = (x as f32 + 0.5 - cx).abs() - (hx - r);
@@ -955,8 +992,8 @@ fn round_rect_shadow(buf: &mut [u8], w: u32, h: u32, rect: Rect, r: f32) {
             let out = (dx.max(0.0).powi(2) + dy.max(0.0).powi(2)).sqrt();
             let d = out + dx.max(dy).min(0.0) - r;
             // 縁(d=0)で最大、外へ SHADOW_BLUR ぶんかけて 0 へ落とす
-            let t = ((SHADOW_BLUR - d) / SHADOW_BLUR).clamp(0.0, 1.0);
-            blend(buf, w, h, x, y, SHADOW, t * t * (3.0 - 2.0 * t) * SHADOW_A);
+            let t = ((shadow_blur() - d) / shadow_blur()).clamp(0.0, 1.0);
+            blend(buf, w, h, x, y, SHADOW, t * t * (3.0 - 2.0 * t) * shadow_a());
         }
     }
 }
@@ -1066,20 +1103,20 @@ fn tint_glyph(buf: &mut [u8], w: u32, h: u32, x0: u32, y0: u32, glyph: &Glyph, c
 /// アイコン下の下線(バー描画とテストの両方から使う)。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Mark {
-    /// 表示中のセッション。水色で、タイル幅いっぱいの長さ。
+    /// 表示中のセッション。水色で、`MARK_PCT` の長さ。
     Active,
-    /// 開いているが表示していないセッション。灰色で短く。
+    /// 開いているが表示していないセッション。灰色で、その半分の長さ。
     Open,
     /// セッションが無い。下線を引かない。
     None,
 }
 
 impl Mark {
-    /// 下線の色。`None` なら引かない。長さは状態によらず `MARK_PCT`。
-    fn color(self) -> Option<[u8; 3]> {
+    /// 下線の色と、タイル幅に対する長さの割合。`None` なら引かない。
+    fn style(self) -> Option<([u8; 3], u32)> {
         match self {
-            Mark::Active => Some(BLUE),
-            Mark::Open => Some(GRAY),
+            Mark::Active => Some((BLUE, MARK_PCT)),
+            Mark::Open => Some((GRAY, MARK_OPEN_PCT)),
             Mark::None => Option::None,
         }
     }
@@ -1282,16 +1319,18 @@ mod tests {
         // 外枠リングは持たない。円の縁まで白のまま
         assert_eq!(px(&buf, cx + bar.tile_d / 2 - 2, cy), WHITE, "外枠リングが残っている");
 
-        // 下線の長さは状態によらず円の直径の半分。違うのは色だけ
+        // 水色は円の直径の半分、灰色はさらにその半分
         let half = (bar.tile_d * MARK_PCT / 100 / 2) as i32;
+        let open_half = (bar.tile_d * MARK_OPEN_PCT / 100 / 2) as i32;
         // shorts=表示中 → 水色
         assert_eq!(mark_px(&buf, &bar, 1, 0), BLUE, "表示中の下線が水色でない");
         assert_eq!(mark_px(&buf, &bar, 1, half - 2), BLUE, "表示中の下線が短い");
-        assert_eq!(mark_px(&buf, &bar, 1, half + 2), BG, "表示中の下線が長い");
-        // bluetooth=開いているだけ → 同じ長さの灰色
+        assert_ne!(mark_px(&buf, &bar, 1, half + 2), BLUE, "表示中の下線が長い");
+        // bluetooth=開いているだけ → 水色の半分の長さの灰色
         assert_eq!(mark_px(&buf, &bar, 2, 0), GRAY, "非表示セッションの下線が灰色でない");
-        assert_eq!(mark_px(&buf, &bar, 2, half - 2), GRAY, "灰色の下線が短い");
-        assert_eq!(mark_px(&buf, &bar, 2, half + 2), BG, "灰色の下線が長い");
+        assert_eq!(mark_px(&buf, &bar, 2, open_half - 2), GRAY, "灰色の下線が短い");
+        assert_ne!(mark_px(&buf, &bar, 2, open_half + 2), GRAY, "灰色の下線が長い");
+        assert_ne!(mark_px(&buf, &bar, 2, half - 2), GRAY, "灰色が水色と同じ長さのまま");
         // ssbrowse=セッション無し → 下線なし(円の影が届く場所なので地色より暗い)
         let none = mark_px(&buf, &bar, 3, 0);
         assert!(none != BLUE && none != GRAY, "セッション無しに下線が出ている: {none:?}");
@@ -1308,11 +1347,12 @@ mod tests {
         assert_eq!(px(&buf, icons_right + 4, 2), BG);
         assert_eq!(px(&buf, l.panel.x + l.panel.w + 4, 2), BG);
         // 円の真下には影。地色より暗く、下へ離れるほど薄くなって地色へ戻る
-        // (下線は円の下端から MARK_GAP 空くので、そこまでは影だけが見える)
-        let below = |dy: u32| px(&buf, cx, bar.tile_y + bar.tile_d + dy);
+        // (下線と重なると影だけを見られないので、下線の無い ssbrowse で測る)
+        let ncx = bar.xs[3] + bar.tile_d / 2;
+        let below = |dy: u32| px(&buf, ncx, bar.tile_y + bar.tile_d + dy);
         let near = below(1);
         assert!(near.iter().zip(BG).all(|(a, b)| *a < b), "円の下に影が無い: {near:?}");
-        let far = below(SHADOW_BLUR as u32 + SHADOW_DY as u32);
+        let far = below((shadow_blur() + SHADOW_DY).ceil() as u32);
         assert_eq!(far, BG, "影がぼかし幅より先まで届いている");
         assert!(near[2] < below(3)[2], "下へ行くほど薄くなっていない");
 
@@ -1624,6 +1664,24 @@ mod tests {
         let four = draw(&[row(1, St::Run), row(2, St::Done), row(3, St::Ask), row(4, St::Seen)]);
         assert!(!ink(&four, gap_x0, gap_x1, top), "上の段がはみ出している");
         assert!(!ink(&four, gap_x0, gap_x1, bottom), "下の段がはみ出している");
+    }
+
+    #[test]
+    fn shadow_env_clamps_and_falls_back() {
+        // 濃さ: 0 は「影なし」として通す(env_f32 だと既定へ落ちてしまう値)
+        assert_eq!(shadow_a_of(Some("0")), 0.0, "0 は影なしとして効く");
+        assert_eq!(shadow_a_of(Some(" 0.4 ")), 0.4, "前後の空白は無視する");
+        assert_eq!(shadow_a_of(Some("2")), 1.0, "1 より濃くはならない");
+        for bad in [None, Some("-1"), Some("abc"), Some("")] {
+            assert_eq!(shadow_a_of(bad), SHADOW_A, "{bad:?} は既定へ落ちる");
+        }
+        // ぼかし幅: 0 除算を避けるため下限を持つ
+        assert_eq!(shadow_blur_of(Some("12")), 12.0);
+        assert_eq!(shadow_blur_of(Some("0")), 0.5, "0 は下限まで");
+        assert_eq!(shadow_blur_of(Some("999")), 64.0, "上限で頭打ち");
+        for bad in [None, Some("abc"), Some("")] {
+            assert_eq!(shadow_blur_of(bad), SHADOW_BLUR, "{bad:?} は既定へ落ちる");
+        }
     }
 
     #[test]

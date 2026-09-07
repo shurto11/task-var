@@ -10,6 +10,11 @@
 #   TASKVAR_CTRL_GAP=12 scripts/restart.sh   # ボタンと進捗バーの間を 12px に(既定 5px)
 #   TASKVAR_BTN_D_PLAY=35 scripts/restart.sh # 再生/停止ボタンを 35px に(既定 30px)
 #   TASKVAR_CLAWD_PX=14 scripts/restart.sh   # clawd 枠の見出しを 20px 以外に
+#   TASKVAR_SHADOW_A=0.3 scripts/restart.sh  # 影を濃く(既定 0.05、0 で影なし、上限 1)
+#   TASKVAR_SHADOW_BLUR=7 scripts/restart.sh # 影のぼかし幅を広く(既定 2px、0.5〜64)
+#
+# 影の濃さ(TASKVAR_SHADOW_A)は白円・左右の枠・パネルと clawd のキャラで共通。
+# キャラの影は円の 0.6 倍の濃さになるよう追従する。
 #
 # バー高さ(TASKVAR_BAR_H)は 24px 〜 画面の半分。端末のセル境界へスナップするので
 # 指定より少し高くなることがある。アイコン(TASKVAR_ICON_D)は無指定だとバー高さの
