@@ -33,7 +33,7 @@ ChromeOS でいうシェルフとの対応は次のとおり。
 
 ### アイコン列(中央)
 
-tmux / YouTube Shorts / Bluetooth / ssbrowse / eduroam / Google カレンダーの
+tmux / YouTube Shorts / Bluetooth / fbrowse / eduroam / Google カレンダーの
 6 個。タップすると対応する tmux セッションへ遷移し、無ければ作ってから
 プログラムを起動する。
 
@@ -205,8 +205,8 @@ cargo build --release && scripts/restart.sh
   行数がずれる
 - 全画面クライアント(fbhalf)の間はバーを隠し、画面下端の
   上スワイプで 3 秒だけ出す(端末の縮小も解除して全高を明け渡す)
-- ssbrowse はスワイプ表示モードにしない。tmux ペインを追って描画するので、
+- fbrowse はスワイプ表示モードにしない。tmux ペインを追って描画するので、
   端末を縮めたままにすればブラウザの描画領域がバーの上で完結する
-  (tmux のステータス行と同じ扱い。ssbrowse 側もセル高をセル幅の 2 倍から
+  (tmux のステータス行と同じ扱い。fbrowse 側もセル高をセル幅の 2 倍から
   求めるようにしてある — 端末行数だけを縮めた状態で画面高 / 行数を使うと
   セルが過大になり、ペインがバーへ食い込むため)

@@ -20,7 +20,7 @@ pub const ICONS: [IconDef; 6] = [
     IconDef { name: "tmux", session: None, svg: include_bytes!("../assets/tmux.svg") },
     IconDef { name: "shorts", session: Some("shorts"), svg: include_bytes!("../assets/shorts.svg") },
     IconDef { name: "bluetooth", session: Some("bluetooth"), svg: include_bytes!("../assets/bluetooth.svg") },
-    IconDef { name: "ssbrowse", session: Some("ssbrowse"), svg: include_bytes!("../assets/ssbrowse.svg") },
+    IconDef { name: "fbrowse", session: Some("fbrowse"), svg: include_bytes!("../assets/fbrowse.svg") },
     IconDef { name: "eduroam", session: Some("eduroam"), svg: include_bytes!("../assets/eduroam.svg") },
     IconDef { name: "calendar", session: Some("calendar"), svg: include_bytes!("../assets/calendar.svg") },
 ];
@@ -48,7 +48,7 @@ fn session_command(session: &str) -> String {
         "spotify" => format!("{home}/ssd/tui/spotatui/target/release/spotatui"),
         "shorts" => format!("{home}/ssd/claude/dopagaki/target/release/dopagaki standalone"),
         "bluetooth" => "bluetoothctl".to_string(),
-        "ssbrowse" => format!("cd {home}/ssd/ssbrowse && npm run browser:auto"),
+        "fbrowse" => format!("{home}/ssd/fb/fbrowse/target/release/fbrowse --auto"),
         // eduroam は ~/.bashrc の関数(sudo wpa_supplicant ...)なので対話bash経由で呼ぶ
         "eduroam" => "bash -ic eduroam".to_string(),
         // calendar-tui は credentials.json をカレントディレクトリから探すため、

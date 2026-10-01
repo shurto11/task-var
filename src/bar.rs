@@ -1188,7 +1188,7 @@ mod tests {
 
     #[test]
     fn marks_follow_session_state() {
-        // ICONS: [tmux, shorts, bluetooth, ssbrowse, eduroam, calendar]
+        // ICONS: [tmux, shorts, bluetooth, fbrowse, eduroam, calendar]
         // (spotify は再生情報パネルが受け持つのでアイコン列には並べない)
         let st = state("bluetooth", &["bluetooth", "shorts"]);
         assert_eq!(mark(&ICONS[2], &st), Mark::Active, "表示中は水色");
@@ -1331,7 +1331,7 @@ mod tests {
         assert_eq!(mark_px(&buf, &bar, 2, open_half - 2), GRAY, "灰色の下線が短い");
         assert_ne!(mark_px(&buf, &bar, 2, open_half + 2), GRAY, "灰色の下線が長い");
         assert_ne!(mark_px(&buf, &bar, 2, half - 2), GRAY, "灰色が水色と同じ長さのまま");
-        // ssbrowse=セッション無し → 下線なし(円の影が届く場所なので地色より暗い)
+        // fbrowse=セッション無し → 下線なし(円の影が届く場所なので地色より暗い)
         let none = mark_px(&buf, &bar, 3, 0);
         assert!(none != BLUE && none != GRAY, "セッション無しに下線が出ている: {none:?}");
         // tmux は名前付きセッション(shorts)を表示中なので灰色。消えることはない
@@ -1347,7 +1347,7 @@ mod tests {
         assert_eq!(px(&buf, icons_right + 4, 2), BG);
         assert_eq!(px(&buf, l.panel.x + l.panel.w + 4, 2), BG);
         // 円の真下には影。地色より暗く、下へ離れるほど薄くなって地色へ戻る
-        // (下線と重なると影だけを見られないので、下線の無い ssbrowse で測る)
+        // (下線と重なると影だけを見られないので、下線の無い fbrowse で測る)
         let ncx = bar.xs[3] + bar.tile_d / 2;
         let below = |dy: u32| px(&buf, ncx, bar.tile_y + bar.tile_d + dy);
         let near = below(1);
