@@ -46,7 +46,7 @@ fn session_command(session: &str) -> String {
     let home = home();
     match session {
         "spotify" => format!("{home}/ssd/tui/spotatui/target/release/spotatui"),
-        "shorts" => format!("{home}/ssd/tools/dopagaki/target/release/dopagaki standalone"),
+        "shorts" => format!("{home}/ssd/claude/dopagaki/target/release/dopagaki standalone"),
         "bluetooth" => "bluetoothctl".to_string(),
         "ssbrowse" => format!("cd {home}/ssd/ssbrowse && npm run browser:auto"),
         // eduroam は ~/.bashrc の関数(sudo wpa_supplicant ...)なので対話bash経由で呼ぶ
@@ -68,7 +68,7 @@ pub fn activate(def: &IconDef, state: &tmux::State) -> Result<()> {
     let Some(session) = def.session else {
         // tmux アイコン: 常に現セッションの新規ウィンドウでスイッチャーを実行
         let current = state.current.as_deref().context("表示中セッションが不明です")?;
-        let bin = format!("{}/ssd/tools/tmux-session/target/release/tmux-session", home());
+        let bin = format!("{}/ssd/fb/tmux-session/target/release/tmux-session", home());
         if !std::path::Path::new(&bin).exists() {
             bail!("tmux-session バイナリがありません: {bin}");
         }
