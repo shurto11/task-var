@@ -1188,7 +1188,7 @@ mod tests {
 
     #[test]
     fn marks_follow_session_state() {
-        // ICONS: [tmux, shorts, bluetooth, fbrowse, eduroam, calendar]
+        // ICONS: [tmux, shorts, bluetooth, fbrowse, eduroam, calendar, drmterm]
         // (spotify は再生情報パネルが受け持つのでアイコン列には並べない)
         let st = state("bluetooth", &["bluetooth", "shorts"]);
         assert_eq!(mark(&ICONS[2], &st), Mark::Active, "表示中は水色");

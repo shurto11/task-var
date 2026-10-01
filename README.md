@@ -33,8 +33,8 @@ ChromeOS でいうシェルフとの対応は次のとおり。
 
 ### アイコン列(中央)
 
-tmux / YouTube Shorts / Bluetooth / fbrowse / eduroam / Google カレンダーの
-6 個。タップすると対応する tmux セッションへ遷移し、無ければ作ってから
+tmux / YouTube Shorts / Bluetooth / fbrowse / eduroam / Google カレンダー /
+drmterm(外部モニター端末)の 7 個。タップすると対応する tmux セッションへ遷移し、無ければ作ってから
 プログラムを起動する。
 
 白円の下の横線がセッションの状態を表す。

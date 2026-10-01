@@ -16,13 +16,14 @@ pub struct IconDef {
     pub svg: &'static [u8],
 }
 
-pub const ICONS: [IconDef; 6] = [
+pub const ICONS: [IconDef; 7] = [
     IconDef { name: "tmux", session: None, svg: include_bytes!("../assets/tmux.svg") },
     IconDef { name: "shorts", session: Some("shorts"), svg: include_bytes!("../assets/shorts.svg") },
     IconDef { name: "bluetooth", session: Some("bluetooth"), svg: include_bytes!("../assets/bluetooth.svg") },
     IconDef { name: "fbrowse", session: Some("fbrowse"), svg: include_bytes!("../assets/fbrowse.svg") },
     IconDef { name: "eduroam", session: Some("eduroam"), svg: include_bytes!("../assets/eduroam.svg") },
     IconDef { name: "calendar", session: Some("calendar"), svg: include_bytes!("../assets/calendar.svg") },
+    IconDef { name: "drmterm", session: Some("drmterm"), svg: include_bytes!("../assets/drmterm.svg") },
 ];
 
 /// Spotify は再生情報パネルが受け持つので、アイコン列には並べない
@@ -57,6 +58,9 @@ fn session_command(session: &str) -> String {
         "calendar" => format!(
             "cd {home}/ssd/tui/calendar-tui && {home}/ssd/tui/calendar-tui/target/release/calendar-tui"
         ),
+        // drmterm の既定コマンドは `tmux new -A -s ext`。このセッション内から起動すると
+        // TMUX が引き継がれ「sessions should be nested with care」で拒否されるので外す。
+        "drmterm" => format!("env -u TMUX {home}/ssd/drmterm/target/release/drmterm"),
         _ => unreachable!("未知のセッション {session}"),
     }
 }

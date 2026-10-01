@@ -1,7 +1,7 @@
 //! task-var: フレームバッファ画面下部にセッション切替タスクバーを表示する。
 //!
 //! - 左側に白円アイコン(tmux / Spotify / YouTube Shorts / Bluetooth / fbrowse /
-//!   eduroam / カレンダー)を横一列に表示
+//!   eduroam / カレンダー / drmterm)を横一列に表示
 //! - 右側に Spotify の再生情報パネル(アルバムアート・曲名・アーティスト・
 //!   操作ボタン 5 個・進捗バー)を表示する。表示データは spotatui が書く
 //!   `/tmp/spotatui_np.json`、操作とシャッフル/リピート状態は MPRIS。
