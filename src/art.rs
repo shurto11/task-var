@@ -104,6 +104,11 @@ impl Accent {
     fn from_hs(h: f32, s: f32) -> Self {
         Self { fill: from_hsl(h, s, FILL_L), edge: from_hsl(h, s, EDGE_L) }
     }
+
+    /// Melon 枠でアートが未取得のとき。Melon グリーン(#00CD3C の色相)。
+    pub fn melon() -> Self {
+        Self::from_hs(138.0, 0.75)
+    }
 }
 
 /// アルバムアート(side*side*4 の BGRA)から代表色を選ぶ。

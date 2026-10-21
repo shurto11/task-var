@@ -8,6 +8,9 @@
 //! - その間の枠に、動いている Claude Code をキャラクター + tmux セッション名で
 //!   最大 4 行並べる(旧 touch-claude)。状態は Claude Code の hooks が
 //!   `task-var hook-*` 経由で Unix ソケットへ送ってくる。タップでそのペインへ遷移。
+//! - clawd 枠の右隣に、追っている曲(既定は NMIXX の 3 曲)の Melon TOP100 順位を
+//!   10 秒ごとに切り替えて出す。guyso.me から 1 時間ごとに取り直す(melon.rs)。
+//!   タップで melon-chart-tui のセッションへ遷移。
 //! - タッチ入力は touch-server から受け取る(バー矩形を region として申告)
 //! - アイコンタップで対応 tmux セッションへ遷移(なければ作成してプログラム実行)
 //! - 通常は端末行数を縮めてバー領域を専有し、終了時に復元する(touch-key と同方式)
@@ -30,6 +33,7 @@ mod clawd;
 mod fb;
 mod fb_client;
 mod icons;
+mod melon;
 mod mpris;
 mod np;
 mod sprite;
@@ -39,10 +43,11 @@ mod tmux;
 mod touch_client;
 
 use anyhow::Result;
-use bar::{Bar, ClawdView, Hit, NpView};
+use bar::{Bar, ClawdView, Hit, MelonView, NpView};
 use clawd::Row;
 use mpris::{Pending, PlayerState, Snapshot};
 use np::NowPlaying;
+use std::collections::HashMap;
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -143,6 +148,74 @@ impl Np {
     }
 }
 
+/// Melon 枠まわりの現在値。取得スレッドとアート取得スレッドの結果を main の
+/// ループが取り込む。枠には追っている曲を `melon::ROTATE_EVERY` ごとに 1 曲ずつ出す。
+struct Melon {
+    shared: Arc<Mutex<Option<Vec<melon::Chart>>>>,
+    art: art::Art,
+    /// 取れている曲(追う順)。
+    now: Vec<melon::Chart>,
+    /// 取得済みのアルバムアート(URL → BGRA・そこから採った背景色)。
+    /// 曲を切り替えるたびに取り直さないよう、曲ごとに持っておく。
+    covers: HashMap<String, (Vec<u8>, art::Accent)>,
+    /// 切り替えの基準時刻。
+    started: Instant,
+}
+
+impl Melon {
+    /// 取得スレッドを起動する。`side` はアルバムアートの一辺(px)。
+    fn spawn(side: u32) -> Self {
+        let shared = Arc::new(Mutex::new(None));
+        melon::spawn(shared.clone());
+        Self {
+            shared,
+            art: art::Art::spawn(side),
+            now: Vec::new(),
+            covers: HashMap::new(),
+            started: Instant::now(),
+        }
+    }
+
+    /// いま枠に出す曲。
+    fn current(&self) -> Option<&melon::Chart> {
+        melon::rotation(self.started.elapsed(), self.now.len()).map(|i| &self.now[i])
+    }
+
+    /// 新しく取れた時台とアートを取り込む。アートはいま出している曲のぶんだけ
+    /// 頼む(取得スレッドは溜まった依頼の最後しか取りに行かないため)。
+    /// 一巡すれば全曲ぶん揃う。
+    fn refresh(&mut self) {
+        if let Some(list) = self.shared.lock().unwrap().take() {
+            self.now = list;
+        }
+        if let Some(url) = self.current().and_then(|c| c.art_url.clone()) {
+            if !self.covers.contains_key(&url) {
+                self.art.request(&url);
+            }
+        }
+        if let Some((url, bgra)) = self.art.take() {
+            let accent = art::accent(&bgra);
+            self.covers.insert(url, (bgra, accent));
+        }
+    }
+
+    /// 枠に描く内容。まだ 1 曲も取れていなければ None(枠だけ出る)。
+    fn view(&self) -> Option<MelonView<'_>> {
+        let chart = self.current()?;
+        let cover = chart.art_url.as_ref().and_then(|url| self.covers.get(url));
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        Some(MelonView {
+            chart,
+            art: cover.map(|(bgra, _)| bgra.as_slice()),
+            accent: cover.map(|(_, a)| *a).unwrap_or_else(art::Accent::melon),
+            time: chart.time_label(now),
+        })
+    }
+}
+
 /// バー全体を描き直し、(操作ボタンを描いたか, clawd 枠に描いた行) を返す。
 ///
 /// spotatui が居なくてもパネルの枠は出る(中身が Spotify アイコンだけになる)。
@@ -155,12 +228,14 @@ fn redraw(
     buf: &mut [u8],
     state: &tmux::State,
     np: &Np,
+    melon: Option<&Melon>,
     clawd: &Arc<Mutex<clawd::Model>>,
     phase: bool,
 ) -> (bool, Vec<Row>) {
     let view = np.view();
+    let chart = melon.and_then(Melon::view);
     let rows = clawd.lock().unwrap().rows(bar.clawd_cells());
-    bar.draw(buf, state, view.as_ref(), Some(&ClawdView { rows: &rows, phase }));
+    bar.draw(buf, state, view.as_ref(), chart.as_ref(), Some(&ClawdView { rows: &rows, phase }));
     (view.is_some(), rows)
 }
 
@@ -246,13 +321,17 @@ fn daemon() -> Result<()> {
     let mut np = Np::default();
     np.refresh(&art, &player_shared);
 
+    // Melon チャート: 1 時間ごとの取得スレッドとアルバムアートの取得スレッド。
+    // 枠を出す場所が無ければどちらも起こさない。
+    let mut melon = bar.melon_art_side().map(Melon::spawn);
+
     // 動いている claude。Claude Code の hooks が `task-var hook-*` 経由で送ってくる。
     let clawd_model: Arc<Mutex<clawd::Model>> = Arc::new(Mutex::new(clawd::Model::default()));
     clawd::spawn(clawd_model.clone());
     // 走りアニメーションの位相の基準時刻。
     let started = Instant::now();
     let (mut ctrls_shown, mut rows) =
-        redraw(&bar, &mut buf, &state, &np, &clawd_model, clawd_phase(started));
+        redraw(&bar, &mut buf, &state, &np, melon.as_ref(), &clawd_model, clawd_phase(started));
 
     // touch-server クライアント起動。バー表示中は帯全体、非表示中は下端だけを
     // region として申告する(残りは fbhalf 等が受け取れる)。優先度を付けて、
@@ -401,8 +480,18 @@ fn daemon() -> Result<()> {
                     if swiped_up {
                         state = tmux::State::poll();
                         np.refresh(&art, &player_shared);
-                        (ctrls_shown, rows) =
-                            redraw(&bar, &mut buf, &state, &np, &clawd_model, clawd_phase(started));
+                        if let Some(m) = melon.as_mut() {
+                            m.refresh();
+                        }
+                        (ctrls_shown, rows) = redraw(
+                            &bar,
+                            &mut buf,
+                            &state,
+                            &np,
+                            melon.as_ref(),
+                            &clawd_model,
+                            clawd_phase(started),
+                        );
                         show_bar(&fb, &buf)?;
                         bar_shown = true;
                         last_full = Instant::now();
@@ -430,6 +519,12 @@ fn daemon() -> Result<()> {
                     }
                     Some(Hit::Panel) => {
                         let def = actions::spotify();
+                        if let Err(e) = actions::activate(def, &state) {
+                            eprintln!("task-var: {} の起動に失敗: {e:#}", def.name);
+                        }
+                    }
+                    Some(Hit::Melon) => {
+                        let def = actions::melon();
                         if let Err(e) = actions::activate(def, &state) {
                             eprintln!("task-var: {} の起動に失敗: {e:#}", def.name);
                         }
@@ -465,8 +560,15 @@ fn daemon() -> Result<()> {
                 }
                 // タップ直後は状態が変わっているはずなので即時更新
                 state = tmux::State::poll();
-                (ctrls_shown, rows) =
-                    redraw(&bar, &mut buf, &state, &np, &clawd_model, clawd_phase(started));
+                (ctrls_shown, rows) = redraw(
+                    &bar,
+                    &mut buf,
+                    &state,
+                    &np,
+                    melon.as_ref(),
+                    &clawd_model,
+                    clawd_phase(started),
+                );
                 if bar_shown {
                     fb.blit(0, bar_y, screen_w, bar_h, &buf)?;
                     last_full = Instant::now();
@@ -512,9 +614,20 @@ fn daemon() -> Result<()> {
                     clawd::refresh(&clawd_model);
                 }
                 // 再生情報は毎ティック取り込んで描き直す(進捗バーを進めるため)。
+                // Melon 枠も同じついでに取り込む(新しい時台は全面ブリットで出る)。
                 np.refresh(&art, &player_shared);
-                (ctrls_shown, rows) =
-                    redraw(&bar, &mut buf, &state, &np, &clawd_model, clawd_phase(started));
+                if let Some(m) = melon.as_mut() {
+                    m.refresh();
+                }
+                (ctrls_shown, rows) = redraw(
+                    &bar,
+                    &mut buf,
+                    &state,
+                    &np,
+                    melon.as_ref(),
+                    &clawd_model,
+                    clawd_phase(started),
+                );
 
                 if bar_shown {
                     // 全面ブリットは 1 秒に 1 回(fbterm/fbhalf の再描画で消された

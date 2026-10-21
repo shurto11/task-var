@@ -5,6 +5,7 @@
 //! - それ以外は「セッションがあれば switch のみ / なければ作成してコマンド実行 → switch」。
 //! - Spotify の再生情報はバー右側のパネル(bar.rs)が担当するので、ここから
 //!   spotatui-pip デーモンを起動することはしない。
+//! - Melon 枠のタップは melon-chart-tui のセッションへ遷移する(Spotify と同じ扱い)。
 
 use crate::tmux;
 use anyhow::{bail, Context, Result};
@@ -38,6 +39,14 @@ pub fn spotify() -> &'static IconDef {
     &SPOTIFY
 }
 
+/// Melon 枠をタップしたときの遷移先(melon-chart-tui)。アイコンとしては描かない
+/// (枠のアルバム画像が押しどころを兼ねる)ので、グリフは持たない。
+pub const MELON: IconDef = IconDef { name: "melon", session: Some("melon"), svg: &[] };
+
+pub fn melon() -> &'static IconDef {
+    &MELON
+}
+
 fn home() -> String {
     std::env::var("HOME").unwrap_or_else(|_| "/root".to_string())
 }
@@ -47,6 +56,7 @@ fn session_command(session: &str) -> String {
     let home = home();
     match session {
         "spotify" => format!("{home}/ssd/tui/spotatui/target/release/spotatui"),
+        "melon" => format!("{home}/ssd/tui/melon-chart-tui/target/release/melon-chart-tui"),
         "shorts" => format!("{home}/ssd/claude/dopagaki/target/release/dopagaki standalone"),
         "bluetooth" => "bluetoothctl".to_string(),
         "fbrowse" => format!("{home}/ssd/fb/fbrowse/target/release/fbrowse --auto"),
