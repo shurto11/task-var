@@ -34,9 +34,15 @@ const KST_OFFSET: i64 = 9 * 3600;
 const FIRST_TRY_AFTER: i64 = 60;
 /// 今の時台がまだ出ていないときの取り直し間隔。正時から `RETRY_FAST_FOR` までは
 /// 短く、それを過ぎたら(サイトが止まっているなど)間隔を開ける。
+/// 取得そのものに失敗した(ネットが無い)ときは、時刻によらず短い方で取り直す。
 const RETRY_FAST: i64 = 60;
 const RETRY_SLOW: i64 = 300;
 const RETRY_FAST_FOR: i64 = 20 * 60;
+/// 待つときの 1 回の眠りの上限。`thread::sleep` は CLOCK_MONOTONIC で測るので
+/// サスペンド中は進まない。長く 1 回で寝ると、復帰しても寝ていたぶんだけ
+/// 取りに行くのが遅れる(16:01 に 1 時間寝て 16:14〜17:35 にサスペンドすると
+/// 18:22 まで起きない)。これごとに起きて壁時計で期限を確かめる。
+const NAP: i64 = 15;
 
 /// パネルに出す 1 時台ぶんの内容。
 #[derive(Debug, Clone, PartialEq)]
@@ -105,7 +111,7 @@ pub fn spawn(shared: Arc<Mutex<Option<Vec<Chart>>>>) {
         let mut charts: Vec<Option<Chart>> = vec![None; songs.len()];
         loop {
             let hour = (now_unix() + KST_OFFSET).div_euclid(3600);
-            let mut changed = false;
+            let (mut changed, mut failed) = (false, false);
             for (song, slot) in songs.iter().zip(charts.iter_mut()) {
                 // 今の時台まで取れている曲は取り直さない
                 if slot.as_ref().is_some_and(|c| is_current(c, hour)) {
@@ -122,7 +128,10 @@ pub fn spawn(shared: Arc<Mutex<Option<Vec<Chart>>>>) {
                         changed |= slot.as_ref() != Some(&c);
                         *slot = Some(c);
                     }
-                    None => eprintln!("task-var: Melon チャートの取得に失敗 (song {song})"),
+                    None => {
+                        eprintln!("task-var: Melon チャートの取得に失敗 (song {song})");
+                        failed = true;
+                    }
                 }
             }
             if changed {
@@ -130,7 +139,8 @@ pub fn spawn(shared: Arc<Mutex<Option<Vec<Chart>>>>) {
             }
             // いちばん遅れている曲に合わせて次を決める(取れていない曲があれば None)
             let latest = charts.iter().map(|c| c.as_ref().and_then(|c| hour_index(&c.time))).min();
-            std::thread::sleep(next_wait(latest.flatten(), now_unix()));
+            let now = now_unix();
+            sleep_until(now + next_wait(latest.flatten(), failed, now).as_secs() as i64);
         }
     });
 }
@@ -150,17 +160,32 @@ fn now_unix() -> i64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0)
 }
 
-/// 次に取りに行くまでの待ち時間。`latest` は取れた最新の時台(`hour_index`)、
-/// 取得に失敗したなら None。
-fn next_wait(latest: Option<i64>, now_unix: i64) -> Duration {
+/// 壁時計(unix 秒)で `deadline` になるまで待つ。サスペンドから復帰したら
+/// `NAP` 以内に気付いて戻る。
+fn sleep_until(deadline: i64) {
+    loop {
+        let left = deadline - now_unix();
+        if left <= 0 {
+            return;
+        }
+        std::thread::sleep(Duration::from_secs(left.min(NAP) as u64));
+    }
+}
+
+/// 次に取りに行くまでの待ち時間。`latest` は取れた最新の時台(`hour_index`)で、
+/// まだ取れていない曲があれば None。`failed` はこの回に取得そのものが
+/// 失敗した曲があったか(ネットが無い・サイトが落ちている)。
+fn next_wait(latest: Option<i64>, failed: bool, now_unix: i64) -> Duration {
     let now = now_unix + KST_OFFSET;
     let hour = now.div_euclid(3600);
     // 次の正時を少し過ぎたところ。どの場合もここより先へは寝過ごさない
     let next_hour = (hour + 1) * 3600 + FIRST_TRY_AFTER - now;
     let secs = match latest {
+        // 取得に失敗した。つながり直したらすぐ追いつけるよう短い間隔で取り直す
+        _ if failed => RETRY_FAST.min(next_hour),
         // 今の時台まで出ている。次の更新まで待つ
         Some(h) if h >= hour => next_hour,
-        // まだ前の時台のまま(更新待ち)か、取得に失敗した
+        // まだ前の時台のまま(更新待ち)
         _ if now - hour * 3600 < RETRY_FAST_FOR => RETRY_FAST.min(next_hour),
         _ => RETRY_SLOW.min(next_hour),
     };
@@ -391,13 +416,32 @@ mod tests {
         let cur = hour_index("2026-10-21T14:00:00");
         let prev = hour_index("2026-10-21T13:00:00");
         // 今の時台が出ていれば次の正時 + 1 分まで寝る
-        assert_eq!(next_wait(cur, at(14, 47)), Duration::from_secs(14 * 60));
+        assert_eq!(next_wait(cur, false, at(14, 47)), Duration::from_secs(14 * 60));
         // 正時を過ぎてもまだ前の時台なら 1 分おきに取り直す
-        assert_eq!(next_wait(prev, at(14, 1)), Duration::from_secs(60));
-        assert_eq!(next_wait(None, at(14, 5)), Duration::from_secs(60), "取得失敗も同じ");
+        assert_eq!(next_wait(prev, false, at(14, 1)), Duration::from_secs(60));
+        assert_eq!(next_wait(None, false, at(14, 5)), Duration::from_secs(60), "未取得も同じ");
         // 20 分過ぎても出ないなら 5 分おきに開ける
-        assert_eq!(next_wait(prev, at(14, 30)), Duration::from_secs(300));
+        assert_eq!(next_wait(prev, false, at(14, 30)), Duration::from_secs(300));
         // ただし次の正時は寝過ごさない
-        assert_eq!(next_wait(prev, at(14, 58)), Duration::from_secs(3 * 60));
+        assert_eq!(next_wait(prev, false, at(14, 58)), Duration::from_secs(3 * 60));
+    }
+
+    #[test]
+    fn a_failed_fetch_retries_soon_whatever_the_time() {
+        let at = |h, min| kst(2026, 10, 21, h, min);
+        let prev = hour_index("2026-10-21T16:00:00");
+        // サスペンド明けでネットがまだ無い(17:36)。20 分を過ぎていても 1 分後に取り直す
+        assert_eq!(next_wait(prev, true, at(17, 36)), Duration::from_secs(60));
+        assert_eq!(next_wait(None, true, at(17, 50)), Duration::from_secs(60));
+        // 今の時台まで取れている曲があっても、失敗した曲があれば待たない
+        let cur = hour_index("2026-10-21T17:00:00");
+        assert_eq!(next_wait(cur, true, at(17, 40)), Duration::from_secs(60));
+    }
+
+    #[test]
+    fn sleep_until_returns_at_once_for_a_past_deadline() {
+        let t = std::time::Instant::now();
+        sleep_until(now_unix() - 3600);
+        assert!(t.elapsed() < Duration::from_millis(100));
     }
 }
