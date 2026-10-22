@@ -11,20 +11,16 @@
 //! ことがある。正時を過ぎたら取りに行き、まだ今の時台が出ていない曲だけを
 //! 出るまで短い間隔で取り直す。
 //!
-//! 枠には 1 曲ずつ、`ROTATE_EVERY` ごとに切り替えて出す(`rotation`)。
-//!
 //! 取得はアルバムアートと同じく curl のサブプロセスで行う(art.rs 参照)。
 
 use serde::Deserialize;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-/// 既定で追う曲(Melon の songId)。並びが枠に出す順番。
+/// 既定で追う曲(Melon の songId)。並びが枠に左から並べる順番。
 /// NMIXX「긴 소원 (Birthday Wish)」「Blue Valentine」「Heavy Serenade」。
 /// `TASKVAR_MELON_SONGS`(カンマ区切り)で変えられる。
 const SONG_IDS: [&str; 3] = ["603442244", "600243411", "601879407"];
-/// 枠に出す曲を切り替える間隔。
-pub const ROTATE_EVERY: Duration = Duration::from_secs(10);
 const BASE: &str = "https://guyso.me/chart/melon/top100/trend/ranking";
 /// UA が無いと弾かれる。
 const UA: &str = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko)";
@@ -148,12 +144,6 @@ pub fn spawn(shared: Arc<Mutex<Option<Vec<Chart>>>>) {
 /// 今の時台(KST の通し時数 `hour`)まで出ているか。
 fn is_current(c: &Chart, hour: i64) -> bool {
     hour_index(&c.time).is_some_and(|h| h >= hour)
-}
-
-/// `len` 曲を `ROTATE_EVERY` ごとに切り替えるとき、`elapsed` の時点で出す曲。
-/// 1 曲も無ければ None。
-pub fn rotation(elapsed: Duration, len: usize) -> Option<usize> {
-    (len > 0).then(|| (elapsed.as_secs() / ROTATE_EVERY.as_secs()) as usize % len)
 }
 
 fn now_unix() -> i64 {
@@ -399,15 +389,6 @@ mod tests {
         assert!(is_current(&chart(Some(1), Some(1), "2026-10-21T15:00:00"), hour));
         assert!(!is_current(&chart(Some(1), Some(1), "2026-10-21T14:00:00"), hour));
         assert!(!is_current(&chart(None, None, "bad"), hour), "時刻が読めなければ取り直す");
-    }
-
-    #[test]
-    fn rotation_switches_every_ten_seconds() {
-        let at = |s| rotation(Duration::from_secs(s), 3);
-        let got = [at(0), at(9), at(10), at(25), at(30)];
-        assert_eq!(got, [Some(0), Some(0), Some(1), Some(2), Some(0)]);
-        assert_eq!(rotation(Duration::from_secs(15), 1), Some(0), "1 曲なら出しっぱなし");
-        assert_eq!(rotation(Duration::from_secs(15), 0), None);
     }
 
     #[test]

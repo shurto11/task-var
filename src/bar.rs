@@ -14,17 +14,17 @@
 //!
 //! clawd 枠には動いている Claude Code をキャラクター + 作業の要約で最大 4 行ぶん
 //! 縦に並べる(旧 touch-claude)。その右に Melon 枠(追っている曲の TOP100
-//! 順位。1 曲ずつ切り替えて出す)を置く。clawd 枠 + Melon 枠で再生情報パネルと同じ幅を分け合い、
+//! 順位)を置く。clawd 枠 + Melon 枠で再生情報パネルと同じ幅を分け合い、
 //! アイコン列はその左の 2 枠と再生情報パネルの間の中央に置く。
 //!
-//! Melon 枠は 2 行 3 列:
-//!   列① アルバムアート(2 行ぶち抜き) / 列② 順位・前の時台からの動き /
-//!   列③ 曲名・アーティストと集計の時台
+//! Melon 枠は普段は白地に Melon のロゴを置いた細い札で、タップすると左へ
+//! (clawd 枠の上へ)広がり、追っている曲を アルバムアート + 順位・前の時台からの
+//! 動き で横に並べる。右端に集計の時台。
 
 use crate::actions::{IconDef, ICONS};
 use crate::art::Accent;
 use crate::clawd::{Row, St};
-use crate::icons::{self, Glyph};
+use crate::icons::{self, Glyph, Logo};
 use crate::melon::{Chart, Move};
 use crate::mpris::{Ctrl, Loop, PlayerState};
 use crate::np::NowPlaying;
@@ -183,17 +183,22 @@ const CLAWD_ASK: [u8; 3] = [217, 144, 74]; // #4A90D9
 const CLAWD_DONE: [u8; 3] = [76, 201, 242]; // #F2C94C
 const CLAWD_SEEN: [u8; 3] = [158, 158, 158]; // #9E9E9E
 
-// Melon 枠(追っている曲の TOP100 順位。10 秒ごとに 1 曲ずつ切り替えて出す)。
-/// 曲名の列の幅。枠の幅はこれにアート・順位の列を足したもの(`MelonLayout::natural_w`)で、
-/// clawd 枠はパネル幅から枠の幅と `GAP` を引いた残りになる。
-/// 枠の幅は `TASKVAR_MELON_W` で直接変えられ、`MELON_MIN_W` 未満(0 など)なら出さない。
-const MELON_TEXT_W: u32 = 110;
-const MELON_MIN_W: u32 = 120;
-/// 枠内の列間。幅が狭いので再生情報パネルの `GAP` より詰める。
+// Melon 枠(追っている曲の TOP100 順位)。普段は白地にロゴだけの札で、
+// タップで広げたときだけ順位を並べる。
+/// Melon のロゴ(公式アプリアイコン。白地に緑の o)。商標なので埋め込まず、
+/// scripts/fetch-melon-logo.sh が落としたものを起動時に読む。無ければ札は白地だけ。
+const MELON_LOGO: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/assets/melon.png");
+/// ロゴの大きさ。札の短い辺に対する割合で、この正方形に収める。
+const MELON_LOGO_PCT: u32 = 60;
+/// 札の幅の既定は札の高さ(正方形)。clawd 枠はパネル幅から札の幅と `GAP` を
+/// 引いた残りになる。札の幅は `TASKVAR_MELON_W` で直接変えられ、
+/// `MELON_MIN_W` 未満(0 など)なら出さない。
+const MELON_MIN_W: u32 = 16;
+/// 広げた枠のアートと順位の列の間。幅が狭いので再生情報パネルの `GAP` より詰める。
 const MELON_GAP: u32 = 8;
 /// 順位と前の時台からの動きの文字サイズ。決め打ち。
-/// 曲名とアーティスト名(と時台)は再生情報パネルと同じ大きさを使う
-/// (`TITLE_PX` / `ARTIST_PX`。env で変えれば両方に効く)。
+/// 時台は再生情報パネルのアーティスト名と同じ大きさを使う
+/// (`ARTIST_PX`。env で変えれば両方に効く)。
 const MELON_RANK_PX: f32 = 30.0;
 const MELON_MOVE_PX: f32 = 18.0;
 /// 順位の列幅。順位の文字サイズに対する比で、"100" が入る幅。
@@ -205,8 +210,6 @@ const MELON_RANK_CAP: f32 = 0.51;
 const MELON_MOVE_CAP: f32 = 0.57;
 /// 順位と動きの間隔。
 const MELON_STACK_GAP: f32 = 6.0;
-/// アーティスト名と時台の間の最低限の空き。
-const MELON_TIME_GAP: f32 = 6.0;
 // 動きの色。Melon に倣って上昇=赤・下降=青。暗い下地で読めるよう明るめにする。
 const MELON_UP: [u8; 3] = [0x5E, 0x4D, 0xFF]; // #FF4D5E
 const MELON_DOWN: [u8; 3] = [0xFF, 0xA8, 0x6A]; // #6AA8FF
@@ -520,75 +523,84 @@ impl ClawdLayout {
     }
 }
 
-/// Melon 枠の位置(バーローカル座標)。曲名の列の行の分け方は再生情報パネルと同じ。
-/// 順位の列は行に合わせず、順位と動きをひと塊にして枠の縦中央に置く
-/// (文字が大きく、行の高さに収まらないため)。
-/// 幅はアート・順位の列と、曲名の列(`MELON_TEXT_W`)を足したもの。
+/// Melon 枠の位置(バーローカル座標)。
+///
+/// 普段は左の枠(clawd 枠 + Melon 枠)の右端に寄せた細い札(`logo`)だけを出し、
+/// 空いたぶんは clawd 枠に回す。タップで広げると、左の枠をまるごと覆う `open` に
+/// 曲を横に並べる(clawd 枠はその間だけ隠れる)。右端は札と同じなので、
+/// 左へ伸びて見える。
+///
+/// 広げた枠の 1 曲ぶんは アート + 順位の列。順位の列は順位と動きをひと塊にして
+/// 枠の縦中央に置く。曲の並べ方は曲数と時台の幅で決まるので描くときに割り付ける
+/// (`slots`)。
 struct MelonLayout {
-    panel: Rect,
-    art: Rect,
-    rank_x: u32,
+    /// 普段の札(白地にロゴ)。
+    logo: Rect,
+    /// 広げたときの枠。
+    open: Rect,
+    /// 広げた枠に並べるアルバムアートの一辺と上端。
+    art_side: u32,
+    art_y: u32,
+    /// 順位の列幅。
     rank_w: u32,
-    text_x: u32,
-    text_w: u32,
-    row1_y: u32,
-    row1_h: u32,
-    row2_y: u32,
-    row2_h: u32,
-    /// 曲名とアーティスト名(と時台)の文字サイズ。再生情報パネルと同じ。
-    title_px: f32,
+    /// 時台の文字サイズ。再生情報パネルのアーティスト名と同じ。
     sub_px: f32,
 }
 
 impl MelonLayout {
-    /// 高さ h のバーで、曲名の列が `MELON_TEXT_W` になる枠の幅。
-    /// アートは枠の高さで決まるので、バーが高いほど広くなる。
-    fn natural_w(h: u32) -> u32 {
-        let art = h.saturating_sub(INSET * 2 + PAD * 2).max(1);
-        PAD * 2 + art + MELON_GAP * 2 + (MELON_RANK_PX * MELON_RANK_EM) as u32 + MELON_TEXT_W
-    }
-
-    /// バーの x に幅 w で置く。狭すぎれば None(枠ごと出さない)。
-    /// 曲名・アーティスト名の文字サイズは再生情報パネルのもの(`title_px` / `sub_px`)を渡す。
-    fn new(h: u32, x: u32, w: u32, title_px: f32, sub_px: f32) -> Option<Self> {
+    /// 左の枠がバーの x から幅 left_w を占めるとき、その右端に幅 w の札を置く。
+    /// 札が狭すぎれば None(枠ごと出さない)。
+    fn new(h: u32, x: u32, left_w: u32, w: u32, sub_px: f32) -> Option<Self> {
         if w < MELON_MIN_W {
             return None;
         }
-        let panel = Rect { x, y: INSET, w, h: h.saturating_sub(INSET * 2) };
-        let content_h = panel.h.saturating_sub(PAD * 2).max(1);
-        let row1_h = (content_h / 2 + 2).min(content_h);
-        let (content_x, content_y) = (x + PAD, panel.y + PAD);
-        let art_side = content_h.min(w - PAD * 2);
-        let art = Rect { x: content_x, y: content_y, w: art_side, h: art_side };
-        let rank_x = art.x + art.w + MELON_GAP;
-        let rank_w = (MELON_RANK_PX * MELON_RANK_EM) as u32;
-        let text_x = rank_x + rank_w + MELON_GAP;
+        let panel_h = h.saturating_sub(INSET * 2);
+        let w = w.min(left_w);
+        let open = Rect { x, y: INSET, w: left_w, h: panel_h };
+        let logo = Rect { x: x + left_w - w, w, ..open };
+        let art_side = panel_h.saturating_sub(PAD * 2).max(1);
         Some(Self {
-            panel,
-            art,
-            rank_x,
-            rank_w,
-            text_x,
-            text_w: (x + w - PAD).saturating_sub(text_x),
-            row1_y: content_y,
-            row1_h,
-            row2_y: content_y + row1_h,
-            row2_h: content_h - row1_h,
-            title_px,
+            logo,
+            open,
+            art_side,
+            art_y: open.y + PAD,
+            rank_w: (MELON_RANK_PX * MELON_RANK_EM) as u32,
             sub_px,
         })
+    }
+
+    /// 広げた枠に n 曲並べるときの、各曲のアートの左端 x。
+    /// 右端に幅 time_w の時台を置くぶんを残し、曲と曲・最後の曲と時台の間が
+    /// 同じ幅になるよう散らす。`GAP` も空けられないほど入りきらない曲は落とす
+    /// (返す数が n より少なくなる)。
+    fn slots(&self, n: usize, time_w: u32) -> Vec<u32> {
+        let cell = self.art_side + MELON_GAP + self.rank_w;
+        let left = self.open.x + PAD;
+        let room = self.open.w.saturating_sub(PAD * 2 + time_w);
+        let n = n.min((room / (cell + GAP)) as usize);
+        if n == 0 {
+            return Vec::new();
+        }
+        let gap = (room - cell * n as u32) / n as u32;
+        (0..n as u32).map(|i| left + i * (cell + gap)).collect()
     }
 }
 
 /// Melon 枠に描く内容。main が組み立てる。
 pub struct MelonView<'a> {
-    pub chart: &'a Chart,
-    /// アルバムアート(art 一辺の正方形・BGRA)。未取得なら None。
-    pub art: Option<&'a [u8]>,
-    /// 背景グラデーションの起点色。アートから採る。未取得なら Melon グリーン。
-    pub accent: Accent,
-    /// 集計の時台の表示(`Chart::time_label`)。
+    /// 広げて順位を並べているか。false なら札(白地にロゴ)だけ。
+    pub open: bool,
+    /// 取れている曲(追う順)。1 曲も取れていなければ空で、広げても枠だけになる。
+    pub songs: Vec<MelonSong<'a>>,
+    /// 集計の時台の表示(`Chart::time_label`)。曲ごとにずれていれば、いちばん古いもの。
     pub time: String,
+}
+
+/// 広げた Melon 枠に並べる 1 曲ぶん。
+pub struct MelonSong<'a> {
+    pub chart: &'a Chart,
+    /// アルバムアート(一辺 `Bar::melon_art_side` の正方形・BGRA)。未取得なら None。
+    pub art: Option<&'a [u8]>,
 }
 
 /// clawd 枠に描く内容。main が毎ティック組み立てる。
@@ -618,7 +630,7 @@ pub enum Hit {
     Panel,
     /// clawd 枠の n 行目。その claude が動くペインへ遷移する。
     Clawd(usize),
-    /// Melon 枠。melon-chart-tui のセッションへ遷移する。
+    /// Melon 枠。札なら広げ、広げた枠なら札に戻す。
     Melon,
 }
 
@@ -639,6 +651,8 @@ pub struct Bar {
     np: NpLayout,
     clawd: Option<ClawdLayout>,
     melon: Option<MelonLayout>,
+    /// Melon の札に置くロゴ。読めなければ None(札は白地だけ)。
+    melon_logo: Option<Logo>,
     /// キャラのスプライト。読めなければ枠を出さない。
     sprite: Option<Sprite>,
 }
@@ -668,15 +682,31 @@ impl Bar {
         let avail = w.saturating_sub(margin * 2 + GAP * 2 + total) / 2;
         let np = NpLayout::new(w, h, margin, avail);
         // 左側はパネルと同じ幅(左右が揃って中央のアイコン列が引き立つ)。
-        // そこから Melon 枠の幅を先に取り、clawd 枠は残りを使う。
-        let melon_w = env_u32("TASKVAR_MELON_W", MelonLayout::natural_w(h)).min(np.panel.w);
+        // そこから Melon 枠(普段の札。既定は正方形)の幅を先に取り、clawd 枠は残りを使う。
+        let melon_w = env_u32("TASKVAR_MELON_W", h.saturating_sub(INSET * 2)).min(np.panel.w);
         let clawd_w = match melon_w {
             mw if mw >= MELON_MIN_W => np.panel.w.saturating_sub(mw + GAP),
             _ => np.panel.w,
         };
         let clawd = ClawdLayout::new(h, margin, clawd_w);
-        let melon_x = clawd.as_ref().map(|l| l.panel.x + l.panel.w + GAP).unwrap_or(margin);
-        let melon = MelonLayout::new(h, melon_x, melon_w, np.title_px, np.artist_px);
+        // 札は clawd 枠の右隣。広げた枠は左端(clawd 枠の左端)から札の右端まで
+        let melon_right = match &clawd {
+            Some(l) => l.panel.x + l.panel.w + GAP + melon_w,
+            None => margin + np.panel.w,
+        };
+        let melon_left_w = melon_right.saturating_sub(margin);
+        let melon = MelonLayout::new(h, margin, melon_left_w, melon_w, np.artist_px);
+        let melon_logo = melon.as_ref().and_then(|l| {
+            let side = (l.logo.w.min(l.logo.h) * MELON_LOGO_PCT / 100).max(1);
+            icons::load_logo(MELON_LOGO, side, side)
+                .map_err(|e| {
+                    eprintln!(
+                        "task-var: Melon のロゴを読めません(札は白地だけ。\
+                         scripts/fetch-melon-logo.sh で取得する): {e:#}"
+                    )
+                })
+                .ok()
+        });
         let ctrl = CTRL_SVGS
             .iter()
             .enumerate()
@@ -698,9 +728,10 @@ impl Bar {
 
         // アイコン列は左の枠(Melon 枠、無ければ clawd 枠)と再生情報パネルの間の
         // 中央。どちらも出せなかったときはバーの左端からの残り全部を間とみなす。
+        // Melon 枠は広げても右端が札と同じなので、アイコン列にはかぶらない。
         let left_end = melon
             .as_ref()
-            .map(|l| l.panel)
+            .map(|l| l.logo)
             .or(clawd.as_ref().map(|l| l.panel))
             .map(|p| p.x + p.w + GAP);
         let icons_x = left_end.unwrap_or(margin);
@@ -730,6 +761,7 @@ impl Bar {
             np,
             clawd,
             melon,
+            melon_logo,
             sprite,
         })
     }
@@ -760,10 +792,10 @@ impl Bar {
 
     /// Melon 枠のアルバムアートに要求する一辺(px)。枠を出さないなら None。
     pub fn melon_art_side(&self) -> Option<u32> {
-        self.melon.as_ref().map(|l| l.art.w)
+        self.melon.as_ref().map(|l| l.art_side)
     }
 
-    /// バー全体を buf(w*h*4 BGRA)へ描画する。
+    /// バー全体を buf(w*h*4 BGRA)へ描画する。`melon` が None なら Melon 枠は札だけ。
     pub fn draw(
         &self,
         buf: &mut [u8],
@@ -789,9 +821,14 @@ impl Bar {
             // 起動していないことが一目で分かるうえタップ先もずれない。
             None => self.draw_np_idle(buf),
         }
-        self.draw_melon(buf, melon);
-        if let Some(view) = clawd {
+        // 広げた Melon 枠は clawd 枠を覆うので、その間は clawd を描かない
+        let melon_open = melon.is_some_and(|v| v.open);
+        if let Some(view) = clawd.filter(|_| !melon_open) {
             self.draw_clawd(buf, view);
+        }
+        match melon.filter(|v| v.open) {
+            Some(view) => self.draw_melon_open(buf, view),
+            None => self.draw_melon_logo(buf),
         }
     }
 
@@ -900,7 +937,7 @@ impl Bar {
             }
         }
         let off = (d - glyph.px) / 2;
-        premul_glyph(buf, self.w, x0 + off, self.tile_y + off, glyph);
+        premul_glyph(buf, self.w, self.h, x0 + off, self.tile_y + off, glyph);
 
         let Some((color, pct)) = mark.style() else { return };
         let mw = (d * pct / 100).max(MARK_H);
@@ -930,7 +967,7 @@ impl Bar {
         let a = self.np.art;
         round_rect(buf, self.w, self.h, a, 6.0, ART_BG);
         let g = &self.art_fallback;
-        premul_glyph(buf, self.w, a.x + (a.w - g.px) / 2, a.y + (a.h - g.px) / 2, g);
+        premul_glyph(buf, self.w, self.h, a.x + (a.w - g.px) / 2, a.y + (a.h - g.px) / 2, g);
     }
 
     /// spotatui が居ないときのパネル。枠と、アルバムアートの場所に置いた
@@ -994,22 +1031,52 @@ impl Bar {
         }
     }
 
-    /// Melon 枠を描く。まだ 1 度も取れていない(`view` が None)ときは
-    /// 枠とアートの下地だけ出す(再生情報パネルと同じく場所は動かさない)。
-    fn draw_melon(&self, buf: &mut [u8], view: Option<&MelonView>) {
+    /// 普段の Melon 枠。白地の札の真ん中に Melon のロゴを置く(ロゴの地も白なので
+    /// 継ぎ目は出ない)。アイコンの白円と同じく、明るい地色の上で影を敷いて浮かせる。
+    fn draw_melon_logo(&self, buf: &mut [u8]) {
         let Some(l) = &self.melon else { return };
-        self.draw_card(buf, l.panel, view.map(|v| v.accent).unwrap_or_else(Accent::melon));
-        match view.and_then(|v| v.art) {
-            Some(bgra) if bgra.len() >= (l.art.w * l.art.h * 4) as usize => {
-                blit_round(buf, self.w, self.h, l.art, bgra, 6.0);
-            }
-            _ => round_rect(buf, self.w, self.h, l.art, 6.0, ART_BG),
-        }
-        let (Some(view), Some(font)) = (view, &self.font) else { return };
-        let c = view.chart;
-        let baseline = |y: u32, h: u32, px: f32| y as f32 + h as f32 / 2.0 + px * 0.35;
+        let p = l.logo;
+        round_rect_shadow(buf, self.w, self.h, p, 10.0);
+        round_rect(buf, self.w, self.h, p, 10.0, WHITE);
+        let Some(g) = &self.melon_logo else { return };
+        let (x, y) = (p.x + p.w.saturating_sub(g.w) / 2, p.y + p.h.saturating_sub(g.h) / 2);
+        premul_blit(buf, self.w, self.h, x, y, g.w, g.h, &g.rgba);
+    }
 
-        // 列②: 順位の下に前の時台からの動き。横は列の中央、縦はひと塊で枠の中央
+    /// 広げた Melon 枠。曲ごとに アート + 順位・動き を横に並べ、右端に集計の時台を置く。
+    /// まだ 1 曲も取れていなければ枠だけ。背景の起点色は Melon グリーン
+    /// (何曲も並ぶので、どれか 1 曲のアートからは採らない)。
+    fn draw_melon_open(&self, buf: &mut [u8], view: &MelonView) {
+        let Some(l) = &self.melon else { return };
+        self.draw_card(buf, l.open, Accent::melon());
+        let time_w = match &self.font {
+            Some(font) if !view.songs.is_empty() => font.width(&view.time, l.sub_px).ceil() as u32,
+            _ => 0,
+        };
+        for (song, x) in view.songs.iter().zip(l.slots(view.songs.len(), time_w)) {
+            let art = Rect { x, y: l.art_y, w: l.art_side, h: l.art_side };
+            match song.art {
+                Some(bgra) if bgra.len() >= (art.w * art.h * 4) as usize => {
+                    blit_round(buf, self.w, self.h, art, bgra, 6.0);
+                }
+                _ => round_rect(buf, self.w, self.h, art, 6.0, ART_BG),
+            }
+            if let Some(font) = &self.font {
+                self.draw_melon_rank(buf, font, song.chart, art.x + art.w + MELON_GAP);
+            }
+        }
+        // 右端に時台。縦は枠の中央
+        if let (Some(font), true) = (&self.font, time_w > 0) {
+            let x = (l.open.x + l.open.w - PAD) as f32 - font.width(&view.time, l.sub_px);
+            let base = l.open.y as f32 + l.open.h as f32 / 2.0 + l.sub_px * 0.35;
+            font.draw(buf, self.w, self.h, x, base, l.sub_px, SUB_TEXT, &view.time);
+        }
+    }
+
+    /// 広げた Melon 枠の順位の列(左端 x)。順位の下に前の時台からの動き。
+    /// 横は列の中央、縦はひと塊で枠の中央。
+    fn draw_melon_rank(&self, buf: &mut [u8], font: &Font, c: &Chart, x: u32) {
+        let Some(l) = &self.melon else { return };
         let rank = c.rank.map(|r| r.to_string()).unwrap_or_else(|| "-".into());
         let (mv, mv_color) = match c.movement() {
             Move::Up(n) => (format!("▲{n}"), MELON_UP),
@@ -1020,36 +1087,16 @@ impl Bar {
         };
         let col = l.rank_w as f32;
         let (rank_h, move_h) = (MELON_RANK_PX * MELON_RANK_CAP, MELON_MOVE_PX * MELON_MOVE_CAP);
-        let top = l.panel.y as f32 + (l.panel.h as f32 - (rank_h + MELON_STACK_GAP + move_h)) / 2.0;
+        let p = l.open;
+        let top = p.y as f32 + (p.h as f32 - (rank_h + MELON_STACK_GAP + move_h)) / 2.0;
         // 字の下端 = ベースライン
         for (text, px, base, color) in [
             (&rank, MELON_RANK_PX, top + rank_h, WHITE),
             (&mv, MELON_MOVE_PX, top + rank_h + MELON_STACK_GAP + move_h, mv_color),
         ] {
             let px = font.shrink_to_fit(text, col, px, px * SHRINK_MIN_PCT);
-            let x = l.rank_x as f32 + (col - font.width(text, px)).max(0.0) / 2.0;
-            font.draw(buf, self.w, self.h, x, base, px, color, text);
-        }
-
-        // 列③: 上段に曲名、下段にアーティスト名と右寄せの時台
-        let max = l.text_w as f32;
-        if max <= 4.0 {
-            return;
-        }
-        let (title, title_px) = fit_title(font, &c.title, max, l.title_px);
-        let y1 = baseline(l.row1_y, l.row1_h, title_px);
-        font.draw(buf, self.w, self.h, l.text_x as f32, y1, title_px, WHITE, &title);
-
-        let px = l.sub_px;
-        let y2 = baseline(l.row2_y, l.row2_h, px);
-        let time_w = font.width(&view.time, px);
-        let time_x = l.text_x as f32 + (max - time_w).max(0.0);
-        font.draw(buf, self.w, self.h, time_x, y2, px, SUB_TEXT, &view.time);
-        // アーティスト名は時台の手前まで。入らなければ `…` で詰める
-        let room = time_x - l.text_x as f32 - MELON_TIME_GAP;
-        if room > 4.0 {
-            let artist = font.fit(&c.artist, room, px);
-            font.draw(buf, self.w, self.h, l.text_x as f32, y2, px, SUB_TEXT, &artist);
+            let tx = x as f32 + (col - font.width(text, px)).max(0.0) / 2.0;
+            font.draw(buf, self.w, self.h, tx, base, px, color, text);
         }
     }
 
@@ -1084,7 +1131,22 @@ impl Bar {
     /// 操作ボタンを描いていない(spotatui が居ない)ので、パネル内はどこを
     /// 押しても遷移になる。`clawd_cells` は
     /// いま描いている clawd の個数(描いていないセルは当たらない)。
-    pub fn hit(&self, lx: f64, ly: f64, ctrls_shown: bool, clawd_cells: usize) -> Option<Hit> {
+    /// `melon_open` は Melon 枠を広げているか。
+    pub fn hit(
+        &self,
+        lx: f64,
+        ly: f64,
+        ctrls_shown: bool,
+        clawd_cells: usize,
+        melon_open: bool,
+    ) -> Option<Hit> {
+        // Melon 枠は札でも広げた枠でもどこを押しても Melon(データが取れる前でも)。
+        // 広げた枠は clawd 枠の上に重なるので、clawd より先に見る。
+        if let Some(l) = &self.melon {
+            if (if melon_open { l.open } else { l.logo }).contains(lx, ly) {
+                return Some(Hit::Melon);
+            }
+        }
         if let Some(l) = &self.clawd {
             for (i, r) in l.cells.iter().take(clawd_cells).enumerate() {
                 if r.contains(lx, ly) {
@@ -1104,10 +1166,6 @@ impl Bar {
         if self.np.panel.contains(lx, ly) {
             return Some(Hit::Panel);
         }
-        // Melon 枠はどこを押しても遷移(データが取れる前の枠だけの状態でも)。
-        if self.melon.as_ref().is_some_and(|l| l.panel.contains(lx, ly)) {
-            return Some(Hit::Melon);
-        }
         // 白円と下線をまとめて受け、その少し外までタッチを許容する。
         for (i, &x0) in self.xs.iter().enumerate() {
             let slot = Rect {
@@ -1121,24 +1179,6 @@ impl Bar {
             }
         }
         None
-    }
-}
-
-/// Melon 枠の曲名を列幅 `max` に収め、(出す文字列, 文字サイズ) を返す。
-/// 曲名は末尾の括弧書き(「긴 소원 (Birthday Wish)」の英題)を落として出す。
-/// 入らなければ `SHRINK_MIN_PCT` まで縮め、それでも入らなければ `…` で詰める。
-fn fit_title(font: &Font, title: &str, max: f32, px: f32) -> (String, f32) {
-    let t = base_title(title);
-    let size = font.shrink_to_fit(t, max, px, px * SHRINK_MIN_PCT);
-    (font.fit(t, max, size), size)
-}
-
-/// 末尾の「 (…)」を落とした曲名。括弧書きが無ければそのまま。
-fn base_title(title: &str) -> &str {
-    let t = title.trim_end();
-    match t.strip_suffix(')').and_then(|s| s.rfind(" (")) {
-        Some(i) if i > 0 => t[..i].trim_end(),
-        _ => t,
     }
 }
 
@@ -1290,13 +1330,18 @@ fn blit_alpha(buf: &mut [u8], w: u32, h: u32, x0: u32, y0: u32, sw: u32, sh: u32
 }
 
 /// プリマルチプライド RGBA のグリフをそのまま合成する(ブランドカラー付き SVG 用)。
-fn premul_glyph(buf: &mut [u8], w: u32, x0: u32, y0: u32, glyph: &Glyph) {
-    for j in 0..glyph.px {
-        for i in 0..glyph.px {
-            let s = ((j * glyph.px + i) * 4) as usize;
-            let (sr, sg, sb, sa) =
-                (glyph.rgba[s], glyph.rgba[s + 1], glyph.rgba[s + 2], glyph.rgba[s + 3]);
-            if sa == 0 {
+fn premul_glyph(buf: &mut [u8], w: u32, h: u32, x0: u32, y0: u32, glyph: &Glyph) {
+    premul_blit(buf, w, h, x0, y0, glyph.px, glyph.px, &glyph.rgba);
+}
+
+/// プリマルチプライド RGBA(sw×sh)を合成する。バッファ(w×h)の外へ出たぶんは捨てる。
+#[allow(clippy::too_many_arguments)]
+fn premul_blit(buf: &mut [u8], w: u32, h: u32, x0: u32, y0: u32, sw: u32, sh: u32, rgba: &[u8]) {
+    for j in 0..sh {
+        for i in 0..sw {
+            let s = ((j * sw + i) * 4) as usize;
+            let (sr, sg, sb, sa) = (rgba[s], rgba[s + 1], rgba[s + 2], rgba[s + 3]);
+            if sa == 0 || x0 + i >= w || y0 + j >= h {
                 continue;
             }
             let off = (((y0 + j) * w + x0 + i) * 4) as usize;
@@ -1366,13 +1411,13 @@ fn mark(def: &IconDef, state: &State) -> Mark {
             }
         }
         // tmux アイコン: 名前付きセッション以外(=通常の作業セッション)を表示中なら水色。
-        // spotify / melon はアイコン列に居ないが名前付きセッションではあるので数に入れる。
+        // spotify はアイコン列に居ないが名前付きセッションではあるので数に入れる。
         // tmux スイッチャーは閉じることが無いので、下線が消えることはない
         // (名前付きセッションを見ている間は灰色になるだけ)。
         None => {
             let named: Vec<&str> = ICONS
                 .iter()
-                .chain([crate::actions::spotify(), crate::actions::melon()])
+                .chain([crate::actions::spotify()])
                 .filter_map(|d| d.session)
                 .collect();
             match state.current.as_deref() {
@@ -1419,11 +1464,11 @@ mod tests {
         }
     }
 
-    fn melon_view<'a>(chart: &'a Chart, art: Option<&'a [u8]>) -> MelonView<'a> {
+    /// 広げた Melon 枠に charts を並べる内容。アートは全曲同じものを流用する。
+    fn melon_view<'a>(charts: &'a [Chart], art: Option<&'a [u8]>) -> MelonView<'a> {
         MelonView {
-            chart,
-            art,
-            accent: art.map(crate::art::accent).unwrap_or_else(Accent::melon),
+            open: true,
+            songs: charts.iter().map(|chart| MelonSong { chart, art }).collect(),
             time: "14:00".into(),
         }
     }
@@ -1440,8 +1485,6 @@ mod tests {
         // spotify も名前付きセッション。アイコンが無くても tmux は灰色のまま
         let sp = state("spotify", &["spotify"]);
         assert_eq!(mark(&ICONS[0], &sp), Mark::Open, "spotify 表示中のtmuxは灰色");
-        let me = state("melon", &["melon"]);
-        assert_eq!(mark(&ICONS[0], &me), Mark::Open, "melon 表示中のtmuxは灰色");
         let st2 = state("main", &["main", "spotify"]);
         assert_eq!(mark(&ICONS[0], &st2), Mark::Active, "通常セッション表示中のtmuxは水色");
         // tmux アイコンだけは、どの状態でも下線が消えない
@@ -1510,9 +1553,12 @@ mod tests {
             };
             let rows = vec![Row { pane: "%1".into(), label: "main".into(), st: St::Run }];
             let clawd = ClawdView { rows: &rows, phase: false };
-            let chart = melon_chart(Some(100), Some(0));
-            let melon = melon_view(&chart, None);
-            bar.draw(&mut buf, &state("main", &["main"]), Some(&view), Some(&melon), Some(&clawd));
+            let charts = [melon_chart(Some(100), Some(0)), melon_chart(None, None)];
+            let melon = melon_view(&charts, None);
+            // 札だけ(None)と広げたところの両方を描ける
+            let st = state("main", &["main"]);
+            bar.draw(&mut buf, &st, Some(&view), None, Some(&clawd));
+            bar.draw(&mut buf, &st, Some(&view), Some(&melon), Some(&clawd));
 
             // 白円 + 下線はバーの中に収まる
             assert!(bar.mark_y + MARK_H <= h, "h={h} で下線がバーの外");
@@ -1523,9 +1569,15 @@ mod tests {
                 assert!(l.panel.x + l.panel.w <= bar.xs[0], "h={h} で clawd 枠に重なった");
             }
             if let Some(m) = &bar.melon {
-                assert!(m.panel.x + m.panel.w <= bar.xs[0], "h={h} で Melon 枠に重なった");
+                // 広げても札と右端が同じなので、アイコン列にはかぶらない
+                assert_eq!(m.open.x + m.open.w, m.logo.x + m.logo.w, "h={h} で右端がずれた");
+                assert!(m.logo.x + m.logo.w <= bar.xs[0], "h={h} で Melon 枠に重なった");
                 if let Some(l) = &bar.clawd {
-                    assert!(l.panel.x + l.panel.w <= m.panel.x, "h={h} で clawd 枠と Melon 枠が重なった");
+                    assert!(l.panel.x + l.panel.w <= m.logo.x, "h={h} で clawd 枠と Melon 枠が重なった");
+                }
+                // ロゴは札の内側
+                if let Some(g) = &bar.melon_logo {
+                    assert!(g.w <= m.logo.w && g.h <= m.logo.h, "h={h} でロゴが札からはみ出す");
                 }
             }
         }
@@ -1592,7 +1644,7 @@ mod tests {
         // アイコン列は左の枠(clawd 枠 + Melon 枠)とパネルの間の中央。左右の余りが揃っている
         let icons_right = bar.xs[ICONS.len() - 1] + bar.tile_d;
         let l = bar.clawd.as_ref().unwrap();
-        let m = bar.melon.as_ref().unwrap().panel;
+        let m = bar.melon.as_ref().unwrap().logo;
         let left_gap = bar.xs[0] - (m.x + m.w);
         let right_gap = bar.np_rect().x - icons_right;
         assert!(left_gap.abs_diff(right_gap) <= 1, "中央でない: 左 {left_gap} / 右 {right_gap}");
@@ -1633,35 +1685,36 @@ mod tests {
         assert_eq!(px(&buf, prog.x + prog.w - 2, prog.y + prog.h / 2), GROOVE);
 
         // 当たり判定: アイコン中心はヒット、アイコン列の左外は外れ
-        assert_eq!(bar.hit(cx as f64, cy as f64, true, 0), Some(Hit::Icon(1)));
-        assert_eq!(bar.hit(2.0, cy as f64, true, 0), None);
+        assert_eq!(bar.hit(cx as f64, cy as f64, true, 0, false), Some(Hit::Icon(1)));
+        assert_eq!(bar.hit(2.0, cy as f64, true, 0, false), None);
 
         // 列③の 5 スロットの中心はそれぞれのボタンを返す
         for (i, ctrl) in CTRLS.iter().enumerate() {
             let s = bar.np.ctrl_slot(i);
             let (sx, sy) = ((s.x + s.w / 2) as f64, (s.y + s.h / 2) as f64);
-            assert_eq!(bar.hit(sx, sy, true, 0), Some(Hit::Ctrl(*ctrl)), "スロット {i}");
+            assert_eq!(bar.hit(sx, sy, true, 0, false), Some(Hit::Ctrl(*ctrl)), "スロット {i}");
             // ボタンを描いていないときは、同じ場所でも遷移扱いになる
-            assert_eq!(bar.hit(sx, sy, false, 0), Some(Hit::Panel), "枠だけのスロット {i}");
+            assert_eq!(bar.hit(sx, sy, false, 0, false), Some(Hit::Panel), "枠だけのスロット {i}");
         }
 
         // ボタン以外のパネル内(アート・曲名・左端の余白)は遷移扱い
         let a = bar.np.art;
         let art_c = ((a.x + a.w / 2) as f64, (a.y + a.h / 2) as f64);
-        assert_eq!(bar.hit(art_c.0, art_c.1, true, 0), Some(Hit::Panel), "アルバムアート");
+        assert_eq!(bar.hit(art_c.0, art_c.1, true, 0, false), Some(Hit::Panel), "アルバムアート");
         let p = bar.np.panel;
         let text_y = (p.y + p.h / 2) as f64;
-        assert_eq!(bar.hit(bar.np.col2_x as f64 + 4.0, text_y, true, 0), Some(Hit::Panel), "曲名");
-        assert_eq!(bar.hit((p.x + 2) as f64, text_y, true, 0), Some(Hit::Panel), "パネル左端");
+        assert_eq!(bar.hit(bar.np.col2_x as f64 + 4.0, text_y, true, 0, false), Some(Hit::Panel), "曲名");
+        assert_eq!(bar.hit((p.x + 2) as f64, text_y, true, 0, false), Some(Hit::Panel), "パネル左端");
         // パネルの外はパネル判定にならない。アイコン列が隣に来たので、
         // 間の隙間はアイコン側の許容範囲(円の外 8px)が受け持つ
-        assert_ne!(bar.hit((p.x - 4) as f64, text_y, true, 0), Some(Hit::Panel), "パネルの左外");
+        assert_ne!(bar.hit((p.x - 4) as f64, text_y, true, 0, false), Some(Hit::Panel), "パネルの左外");
         // 枠だけの状態でもパネル内は遷移のまま
-        assert_eq!(bar.hit(art_c.0, art_c.1, false, 0), Some(Hit::Panel), "枠だけのアート");
+        assert_eq!(bar.hit(art_c.0, art_c.1, false, 0, false), Some(Hit::Panel), "枠だけのアート");
 
         // TASKVAR_TEST_DUMP=path で目視確認用の PPM を書き出す。
         // トグルの ON/OFF でグリフと色が変わるので、両方の状態を出す
         // (path と path.off の 2 枚)。clawd 枠も 4 状態そろえて入れる。
+        // Melon 枠は path が札、path.off が広げたところ。
         if let Ok(path) = std::env::var("TASKVAR_TEST_DUMP") {
             let clawd_rows = [
                 ("touch-claude廃止とセッション表示枠", St::Run),
@@ -1674,11 +1727,7 @@ mod tests {
             .map(|(i, (s, st))| Row { pane: format!("%{i}"), label: s.to_string(), st: *st })
             .collect::<Vec<_>>();
             let clawd = ClawdView { rows: &clawd_rows, phase: false };
-            // Melon 枠は TASKVAR_TEST_ART のアートを流用する(大きさは枠に合わせる)
-            let melon_art = bar.melon_art_side().and_then(test_art);
-            let chart = melon_chart(Some(43), Some(41));
-            let melon = melon_view(&chart, melon_art.as_deref());
-            bar.draw(&mut buf, &st, Some(&view), Some(&melon), Some(&clawd));
+            bar.draw(&mut buf, &st, Some(&view), None, Some(&clawd));
             let dump = |buf: &[u8], to: &str| {
                 let mut ppm = format!("P6\n{w} {h}\n255\n").into_bytes();
                 for p in buf.chunks_exact(4) {
@@ -1694,10 +1743,18 @@ mod tests {
                 art: art.as_deref(),
                 accent: art.as_deref().map(crate::art::accent).unwrap_or_default(),
             };
-            // Melon 枠は上昇・前日の時台
-            let up = melon_chart(Some(26), Some(30));
-            let melon =
-                MelonView { time: "10/20 14:00".into(), ..melon_view(&up, melon_art.as_deref()) };
+            // Melon 枠は広げて 3 曲(下降・上昇・圏外)、前日の時台。
+            // アートは TASKVAR_TEST_ART を流用する(大きさは枠に合わせる)
+            let melon_art = bar.melon_art_side().and_then(test_art);
+            let charts = [
+                melon_chart(Some(43), Some(41)),
+                melon_chart(Some(26), Some(30)),
+                melon_chart(None, None),
+            ];
+            let melon = MelonView {
+                time: "10/20 14:00".into(),
+                ..melon_view(&charts, melon_art.as_deref())
+            };
             let clawd = ClawdView { rows: &clawd_rows, phase: true };
             bar.draw(&mut buf, &st, Some(&off), Some(&melon), Some(&clawd));
             dump(&buf, &format!("{path}.off"));
@@ -1754,7 +1811,7 @@ mod tests {
 
         // ボタンが無くても、パネルを押せば spotatui へ遷移する
         let (cx, cy) = ((p.x + p.w / 2) as f64, (p.y + p.h / 2) as f64);
-        assert_eq!(bar.hit(cx, cy, false, 0), Some(Hit::Panel));
+        assert_eq!(bar.hit(cx, cy, false, 0, false), Some(Hit::Panel));
     }
 
     #[test]
@@ -1764,8 +1821,8 @@ mod tests {
         let l = bar.clawd.as_ref().unwrap();
 
         // 左から clawd 枠・Melon 枠・アイコン列・再生情報パネルの順に並ぶ。
-        // 左の 2 枠でパネルと同じ幅を分け合う
-        let m = bar.melon.as_ref().unwrap().panel;
+        // 左の 2 枠(clawd 枠 + Melon の札)でパネルと同じ幅を分け合う
+        let m = bar.melon.as_ref().unwrap().logo;
         assert_eq!(m.x, l.panel.x + l.panel.w + GAP, "Melon 枠が clawd 枠の右隣にない");
         assert_eq!(m.x + m.w - l.panel.x, bar.np_rect().w, "左の枠の幅がパネルと揃っていない");
         assert_eq!((m.y, m.h), (l.panel.y, l.panel.h), "Melon 枠の高さが clawd 枠と違う");
@@ -1866,12 +1923,12 @@ mod tests {
         // 当たり判定: 描いた 2 つだけが当たる(0 = 左上、1 = 右上)
         let center = |r: Rect| ((r.x + r.w / 2) as f64, (r.y + r.h / 2) as f64);
         let (x0, y0) = center(l.cells[0]);
-        assert_eq!(bar.hit(x0, y0, false, rows.len()), Some(Hit::Clawd(0)));
+        assert_eq!(bar.hit(x0, y0, false, rows.len(), false), Some(Hit::Clawd(0)));
         let (x1, y1) = center(l.cells[1]);
-        assert_eq!(bar.hit(x1, y1, false, rows.len()), Some(Hit::Clawd(1)));
+        assert_eq!(bar.hit(x1, y1, false, rows.len(), false), Some(Hit::Clawd(1)));
         let (x2, y2) = center(l.cells[2]);
-        assert_eq!(bar.hit(x2, y2, false, rows.len()), None, "描いていないセルは当たらない");
-        assert_eq!(bar.hit(x0, y0, false, 0), None, "枠が空なら当たらない");
+        assert_eq!(bar.hit(x2, y2, false, rows.len(), false), None, "描いていないセルは当たらない");
+        assert_eq!(bar.hit(x0, y0, false, 0, false), None, "枠が空なら当たらない");
 
         // 1 つも無ければ場所ごと地色のまま(枠を持たないので何も残らない)。
         // 場所は `ClawdLayout` が確保したままなのでタップ先はずれない
@@ -2027,21 +2084,100 @@ mod tests {
     }
 
     #[test]
-    fn melon_frame_shows_rank_move_title_and_time() {
+    fn melon_frame_is_a_logo_card_until_tapped() {
         let (w, h) = (1366u32, 64u32);
         let bar = Bar::new(w, h).unwrap();
         let l = bar.melon.as_ref().unwrap();
-        assert_eq!(bar.melon_art_side(), Some(l.art.w));
-        // 列はアート → 順位 → 曲名の順で、どれも枠の内側
-        assert!(l.art.x + l.art.w < l.rank_x && l.rank_x + l.rank_w < l.text_x);
-        assert!(l.text_x + l.text_w + PAD <= l.panel.x + l.panel.w, "曲名の列がはみ出す");
-        assert_eq!(l.text_w, MELON_TEXT_W, "既定の幅は曲名の列から決まる");
-        // 曲名・アーティスト名の大きさは再生情報パネルと同じ
-        assert_eq!((l.title_px, l.sub_px), (bar.np.title_px, bar.np.artist_px));
-        if bar.font.is_none() {
+        let p = l.logo;
+        // 札は正方形。空いたぶんは clawd 枠に回る(clawd 枠 + 札で再生情報パネルと同じ幅)
+        assert_eq!(p.w, p.h);
+        let clawd = bar.clawd.as_ref().unwrap();
+        let c = clawd.panel;
+        assert_eq!(c.w + GAP + p.w, bar.np_rect().w);
+        assert_eq!(c.x + c.w + GAP, p.x, "札は clawd 枠の右隣");
+
+        // 札のどこを押しても Melon
+        let mid = p.y + p.h / 2;
+        let spots = [(p.x + 2, p.y + 2), (p.x + p.w / 2, mid), (p.x + p.w - 2, p.y + p.h - 2)];
+        for (x, y) in spots {
+            assert_eq!(bar.hit(x as f64, y as f64, true, 4, false), Some(Hit::Melon), "({x},{y})");
+        }
+        // 札の左は clawd 枠のまま。広げている間だけ同じ場所が Melon になる
+        let cell = clawd.cells[0];
+        let (cx, cy) = ((cell.x + cell.w / 2) as f64, (cell.y + cell.h / 2) as f64);
+        assert_eq!(bar.hit(cx, cy, true, 4, false), Some(Hit::Clawd(0)));
+        assert_eq!(bar.hit(cx, cy, true, 4, true), Some(Hit::Melon));
+        // 広げた枠の外(アイコン列)は広げていても変わらない
+        let (ix, iy) = ((bar.xs[0] + bar.tile_d / 2) as f64, (bar.tile_y + bar.tile_d / 2) as f64);
+        assert_eq!(bar.hit(ix, iy, true, 4, true), Some(Hit::Icon(0)));
+
+        let mut buf = vec![0u8; (w * h * 4) as usize];
+        let px = |buf: &[u8], x: u32, y: u32| -> [u8; 3] {
+            let off = ((y * w + x) * 4) as usize;
+            [buf[off], buf[off + 1], buf[off + 2]]
+        };
+        bar.draw(&mut buf, &state("main", &["main"]), None, None, None);
+        // 白地の札。ロゴの外側は白のまま、札の外(clawd 枠との間)は地色
+        assert_eq!(px(&buf, p.x + 4, mid), WHITE);
+        assert_eq!(px(&buf, p.x + p.w - 4, mid), WHITE);
+        assert_eq!(px(&buf, p.x - GAP / 2, 2), BG);
+
+        let Some(g) = &bar.melon_logo else {
+            eprintln!("assets/melon.png が無いのでロゴの確認はスキップ(scripts/fetch-melon-logo.sh)");
+            return;
+        };
+        // ロゴは札の短い辺の `MELON_LOGO_PCT` の正方形に収まる
+        let side = p.h * MELON_LOGO_PCT / 100;
+        assert_eq!(g.w.max(g.h), side);
+        // 緑のロゴが札の真ん中にある
+        let green: Vec<(u32, u32)> = (p.x..p.x + p.w)
+            .flat_map(|x| (p.y..p.y + p.h).map(move |y| (x, y)))
+            .filter(|&(x, y)| {
+                let [b, g, r] = px(&buf, x, y);
+                g > 150 && r < 100 && b < 120
+            })
+            .collect();
+        assert!(green.len() > 100, "ロゴが描かれていない ({}px)", green.len());
+        let span = |f: fn(&(u32, u32)) -> u32| {
+            (green.iter().map(f).min().unwrap(), green.iter().map(f).max().unwrap())
+        };
+        let ((x0, x1), (y0, y1)) = (span(|g| g.0), span(|g| g.1));
+        assert!((x0 - p.x).abs_diff(p.x + p.w - 1 - x1) <= 2, "ロゴが左右の中央にない");
+        assert!((y0 - p.y).abs_diff(p.y + p.h - 1 - y1) <= 2, "ロゴが上下の中央にない");
+    }
+
+    #[test]
+    fn melon_frame_opens_over_the_clawd_frame_to_show_every_song() {
+        let (w, h) = (1366u32, 64u32);
+        let bar = Bar::new(w, h).unwrap();
+        let l = bar.melon.as_ref().unwrap();
+        let o = l.open;
+        let c = bar.clawd.as_ref().unwrap().panel;
+        // 広げた枠は clawd 枠の左端から札の右端まで(= 再生情報パネルと同じ幅)
+        assert_eq!((o.x, o.x + o.w), (c.x, l.logo.x + l.logo.w));
+        assert_eq!(o.w, bar.np_rect().w);
+        assert_eq!(bar.melon_art_side(), Some(l.art_side));
+
+        // 曲は時台の手前まで等間隔に並び、最後の曲と時台の間も同じだけ空く
+        let cell = l.art_side + MELON_GAP + l.rank_w;
+        let xs = l.slots(3, 40);
+        assert_eq!(xs.len(), 3);
+        assert_eq!(xs[0], o.x + PAD);
+        let gap = xs[1] - (xs[0] + cell);
+        assert!(gap >= GAP);
+        assert_eq!(xs[2] - (xs[1] + cell), gap, "曲の間隔が揃っていない");
+        let to_time = (o.x + o.w - PAD - 40) - (xs[2] + cell);
+        assert!(to_time.abs_diff(gap) <= 2, "時台までの空き {to_time} が曲の間隔 {gap} と違う");
+        // 入りきらない曲は落とす(残った曲も枠からはみ出さない)
+        let many = l.slots(10, 40);
+        assert!(many.len() < 10);
+        assert!(many.iter().all(|&x| x + cell + PAD <= o.x + o.w));
+        assert!(l.slots(0, 40).is_empty());
+
+        let Some(font) = &bar.font else {
             eprintln!("フォントが無い環境なので文字の確認はスキップ");
             return;
-        }
+        };
         let st = state("main", &["main"]);
         let mut buf = vec![0u8; (w * h * 4) as usize];
         let px = |buf: &[u8], x: u32, y: u32| -> [u8; 3] {
@@ -2052,80 +2188,67 @@ mod tests {
         let any_in = |buf: &[u8], x0: u32, x1: u32, y0: u32, y1: u32, f: &dyn Fn([u8; 3]) -> bool| {
             (x0..x1).any(|x| (y0..y1).any(|y| f(px(buf, x, y))))
         };
-        let (r1, r2) = ((l.row1_y, l.row1_y + l.row1_h), (l.row2_y, l.row2_y + l.row2_h));
-        let rank_cols = (l.rank_x, l.rank_x + l.rank_w);
-        let text_cols = (l.text_x, l.text_x + l.text_w);
 
-        // 下降: 順位は白、動きは青
-        let down = melon_chart(Some(43), Some(41));
-        bar.draw(&mut buf, &st, None, Some(&melon_view(&down, None)), None);
+        // 下降・上昇・圏外の 3 曲。2 曲目だけアートが取れている
+        let charts = [
+            melon_chart(Some(43), Some(41)),
+            melon_chart(Some(26), Some(30)),
+            melon_chart(None, None),
+        ];
+        let red_art: Vec<u8> = [0u8, 0, 255, 0].repeat((l.art_side * l.art_side) as usize);
+        let mut view = melon_view(&charts, None);
+        view.songs[1].art = Some(&red_art);
+        let rows = vec![Row { pane: "%1".into(), label: "main".into(), st: St::Run }];
+        let clawd = ClawdView { rows: &rows, phase: false };
+        bar.draw(&mut buf, &st, None, Some(&view), Some(&clawd));
+        // clawd 枠は広げた枠の下に隠れて描かれない(clawd を渡さないときと同じ絵)
+        let mut without = vec![0u8; buf.len()];
+        bar.draw(&mut without, &st, None, Some(&view), None);
+        assert!(buf == without, "広げた枠の上に clawd が描かれている");
+
+        let time_w = font.width(&view.time, l.sub_px).ceil() as u32;
+        let xs = l.slots(3, time_w);
+        assert_eq!(xs.len(), 3);
+        let (p0, p1) = (o.y, o.y + o.h);
+        let col = |i: usize| (xs[i] + l.art_side + MELON_GAP, xs[i] + cell);
+        // どの曲も順位(白)。動きは下降=青・上昇=赤・圏外=灰
         let white = |c: [u8; 3]| near(c, WHITE);
-        assert!(any_in(&buf, rank_cols.0, rank_cols.1, r1.0, r1.1, &white), "順位が描かれていない");
+        for i in 0..3 {
+            assert!(any_in(&buf, col(i).0, col(i).1, p0, p1, &white), "{i} 曲目の順位が無い");
+        }
         let blue = |c: [u8; 3]| near(c, MELON_DOWN);
-        assert!(any_in(&buf, rank_cols.0, rank_cols.1, r2.0, r2.1, &blue), "下降が青でない");
-        // 順位(白)と動き(青)は上下に分かれて重ならず、どちらも枠の内側に収まる
+        assert!(any_in(&buf, col(0).0, col(0).1, p0, p1, &blue), "下降が青でない");
+        let red = |c: [u8; 3]| near(c, MELON_UP);
+        assert!(any_in(&buf, col(1).0, col(1).1, p0, p1, &red), "上昇が赤でない");
+        let sub = |c: [u8; 3]| near(c, SUB_TEXT);
+        assert!(any_in(&buf, col(2).0, col(2).1, p0, p1, &sub), "圏外が灰色でない");
+        // 順位(白)と動き(青)は上下に分かれて重ならず、ひと塊で枠の縦中央にある
         let rows_of = |f: &dyn Fn([u8; 3]) -> bool| -> Vec<u32> {
-            (0..h).filter(|&y| (rank_cols.0..rank_cols.1).any(|x| f(px(&buf, x, y)))).collect()
+            (0..h).filter(|&y| (col(0).0..col(0).1).any(|x| f(px(&buf, x, y)))).collect()
         };
         let (rank_ys, move_ys) = (rows_of(&white), rows_of(&blue));
-        let (p0, p1) = (l.panel.y, l.panel.y + l.panel.h);
         assert!(rank_ys.iter().chain(&move_ys).all(|y| (p0..p1).contains(y)), "枠からはみ出す");
         assert!(rank_ys.last() < move_ys.first(), "順位と動きが重なっている");
         let (above, below) = (rank_ys[0] - p0, p1 - move_ys[move_ys.len() - 1]);
         assert!(above.abs_diff(below) <= 3, "縦の中央にない: 上 {above} / 下 {below}");
-        assert!(any_in(&buf, text_cols.0, text_cols.1, r1.0, r1.1, &white), "曲名が描かれていない");
-        // 下段は右端に時台、左にアーティスト名(どちらも灰色の文字)
-        let sub = |c: [u8; 3]| near(c, SUB_TEXT);
-        let mid = text_cols.0 + l.text_w / 2;
-        assert!(any_in(&buf, mid, text_cols.1, r2.0, r2.1, &sub), "時台が描かれていない");
-        assert!(any_in(&buf, text_cols.0, mid, r2.0, r2.1, &sub), "アーティスト名が描かれていない");
-
-        // 上昇は赤
-        let up = melon_chart(Some(26), Some(30));
-        bar.draw(&mut buf, &st, None, Some(&melon_view(&up, None)), None);
-        let red = |c: [u8; 3]| near(c, MELON_UP);
-        assert!(any_in(&buf, rank_cols.0, rank_cols.1, r2.0, r2.1, &red), "上昇が赤でない");
-
-        // まだ取れていないときは枠だけ。文字のような明るいピクセルは無い
-        bar.draw(&mut buf, &st, None, None, None);
-        let bright = |c: [u8; 3]| c.iter().all(|&v| v >= 150);
-        let p = l.panel;
-        assert!(
-            !any_in(&buf, l.rank_x, p.x + p.w - PAD, p.y + 4, p.y + p.h - 4, &bright),
-            "枠だけのはずが文字が描かれている"
-        );
-        let left = px(&buf, p.x + 3, p.y + p.h / 2);
+        // アートは取れた曲だけ貼られ、まだの曲は下地の色
+        let art_mid = |i: usize| px(&buf, xs[i] + l.art_side / 2, l.art_y + l.art_side / 2);
+        assert_eq!(art_mid(1), [0, 0, 255]);
+        assert_eq!(art_mid(0), ART_BG);
+        // 右端に時台(灰色)。左端の背景は Melon グリーン
+        let right = o.x + o.w - PAD;
+        assert!(any_in(&buf, right - time_w, right, p0, p1, &sub), "時台が描かれていない");
+        let left = px(&buf, o.x + 3, o.y + o.h / 2);
         let want = Accent::melon().fill;
         assert!(near(left, want), "左端が Melon グリーンになっていない: {left:?} vs {want:?}");
-        // Melon 枠はどこを押しても melon-chart-tui へ(clawd にも Spotify にも化けない)
-        let spots =
-            [(p.x + p.w / 2, p.y + p.h / 2), (l.art.x + 2, l.art.y + 2), (p.x + p.w - 2, p.y + 2)];
-        for (x, y) in spots {
-            assert_eq!(bar.hit(x as f64, y as f64, true, 4), Some(Hit::Melon), "({x},{y})");
-        }
-        // 枠の外(clawd 枠との間)は Melon にならない
-        assert_ne!(bar.hit((p.x - 4) as f64, (p.y + p.h / 2) as f64, true, 4), Some(Hit::Melon));
-    }
 
-    #[test]
-    fn melon_title_drops_the_alias() {
-        assert_eq!(base_title("긴 소원 (Birthday Wish)"), "긴 소원");
-        assert_eq!(base_title("Heavy Serenade"), "Heavy Serenade");
-        assert_eq!(base_title("(G)I-DLE"), "(G)I-DLE", "先頭の括弧は落とさない");
-        let Some(font) = Font::load() else {
-            eprintln!("フォントが無い環境なのでスキップ");
-            return;
-        };
-        let title = "긴 소원 (Birthday Wish)";
-        let px = 19.5;
-        // 幅が足りていても英題は出さない
-        let wide = font.width(title, px) + 1.0;
-        assert_eq!(fit_title(&font, title, wide, px), ("긴 소원".to_string(), px));
-        // 括弧書きの無い曲名はそのまま
-        assert_eq!(fit_title(&font, "NEON", wide, px), ("NEON".to_string(), px));
-        // 入らなければ縮め、それでも入らなければ … で詰める
-        let (t, size) = fit_title(&font, title, 20.0, px);
-        assert!(t.ends_with('…'), "{t}");
-        assert!(font.width(&t, size) <= 20.0);
+        // まだ 1 曲も取れていなければ枠だけ。文字やアートのような明るいピクセルは無い
+        let empty = MelonView { open: true, songs: Vec::new(), time: String::new() };
+        bar.draw(&mut buf, &st, None, Some(&empty), None);
+        let bright = |c: [u8; 3]| c.iter().all(|&v| v >= 150);
+        assert!(
+            !any_in(&buf, o.x + PAD, right, o.y + 4, o.y + o.h - 4, &bright),
+            "枠だけのはずが何か描かれている"
+        );
     }
 }

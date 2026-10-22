@@ -8,9 +8,10 @@
 //! - その間の枠に、動いている Claude Code をキャラクター + tmux セッション名で
 //!   最大 4 行並べる(旧 touch-claude)。状態は Claude Code の hooks が
 //!   `task-var hook-*` 経由で Unix ソケットへ送ってくる。タップでそのペインへ遷移。
-//! - clawd 枠の右隣に、追っている曲(既定は NMIXX の 3 曲)の Melon TOP100 順位を
-//!   10 秒ごとに切り替えて出す。guyso.me から 1 時間ごとに取り直す(melon.rs)。
-//!   タップで melon-chart-tui のセッションへ遷移。
+//! - clawd 枠の右隣に Melon 枠。普段は白地に Melon のロゴを置いた細い札で、
+//!   タップすると左へ広がって追っている曲(既定は NMIXX の 3 曲)の Melon TOP100
+//!   順位を並べる。広げた枠をもう 1 度押すと札に戻る(勝手には戻らない)。
+//!   順位は guyso.me から 1 時間ごとに取り直す(melon.rs)。
 //! - タッチ入力は touch-server から受け取る(バー矩形を region として申告)
 //! - アイコンタップで対応 tmux セッションへ遷移(なければ作成してプログラム実行)
 //! - 通常は端末行数を縮めてバー領域を専有し、終了時に復元する(touch-key と同方式)
@@ -43,7 +44,7 @@ mod tmux;
 mod touch_client;
 
 use anyhow::Result;
-use bar::{Bar, ClawdView, Hit, MelonView, NpView};
+use bar::{Bar, ClawdView, Hit, MelonSong, MelonView, NpView};
 use clawd::Row;
 use mpris::{Pending, PlayerState, Snapshot};
 use np::NowPlaying;
@@ -81,6 +82,10 @@ const TOUCH_PRIORITY: i32 = 10;
 
 /// 全面ブリットの最短間隔。この間は進捗バーのためにパネル部分だけを部分ブリットする。
 const FULL_BLIT_EVERY: Duration = Duration::from_secs(1);
+
+/// Melon 枠のアルバムアートのうち、取れなかった曲を後回しにして次の曲へ回す間隔
+/// (`Melon::refresh`)。
+const MELON_ART_TURN: Duration = Duration::from_secs(10);
 
 fn env_u32(name: &str, default: u32) -> u32 {
     std::env::var(name).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
@@ -149,17 +154,20 @@ impl Np {
 }
 
 /// Melon 枠まわりの現在値。取得スレッドとアート取得スレッドの結果を main の
-/// ループが取り込む。枠には追っている曲を `melon::ROTATE_EVERY` ごとに 1 曲ずつ出す。
+/// ループが取り込む。枠は普段はロゴだけの札で、タップするたびに
+/// 広げる(追っている曲を全部並べる)・畳むを切り替える。
 struct Melon {
     shared: Arc<Mutex<Option<Vec<melon::Chart>>>>,
     art: art::Art,
     /// 取れている曲(追う順)。
     now: Vec<melon::Chart>,
-    /// 取得済みのアルバムアート(URL → BGRA・そこから採った背景色)。
-    /// 曲を切り替えるたびに取り直さないよう、曲ごとに持っておく。
-    covers: HashMap<String, (Vec<u8>, art::Accent)>,
-    /// 切り替えの基準時刻。
+    /// 取得済みのアルバムアート(URL → BGRA)。広げたときに全曲ぶん要るので、
+    /// 札の間に 1 曲ずつ取っておく。
+    covers: HashMap<String, Vec<u8>>,
+    /// アート取得の順番を回す基準時刻。
     started: Instant,
+    /// 広げているか。false なら札だけ。
+    open: bool,
 }
 
 impl Melon {
@@ -173,46 +181,55 @@ impl Melon {
             now: Vec::new(),
             covers: HashMap::new(),
             started: Instant::now(),
+            open: false,
         }
     }
 
-    /// いま枠に出す曲。
-    fn current(&self) -> Option<&melon::Chart> {
-        melon::rotation(self.started.elapsed(), self.now.len()).map(|i| &self.now[i])
-    }
-
-    /// 新しく取れた時台とアートを取り込む。アートはいま出している曲のぶんだけ
-    /// 頼む(取得スレッドは溜まった依頼の最後しか取りに行かないため)。
-    /// 一巡すれば全曲ぶん揃う。
+    /// 新しく取れた時台とアートを取り込む。
+    ///
+    /// アートは足りない曲のうち 1 曲だけ頼む(取得スレッドは溜まった依頼の最後しか
+    /// 取りに行かないため)。取れればすぐ次の曲を頼むので順に揃う。取れなかった曲で
+    /// 詰まらないよう、頼む曲は `MELON_ART_TURN` ごとに足りない曲の中で回す。
     fn refresh(&mut self) {
         if let Some(list) = self.shared.lock().unwrap().take() {
             self.now = list;
         }
-        if let Some(url) = self.current().and_then(|c| c.art_url.clone()) {
-            if !self.covers.contains_key(&url) {
-                self.art.request(&url);
-            }
+        let missing: Vec<&String> = self
+            .now
+            .iter()
+            .filter_map(|c| c.art_url.as_ref())
+            .filter(|url| !self.covers.contains_key(*url))
+            .collect();
+        if !missing.is_empty() {
+            let turn = self.started.elapsed().as_secs() / MELON_ART_TURN.as_secs();
+            self.art.request(missing[turn as usize % missing.len()]);
         }
         if let Some((url, bgra)) = self.art.take() {
-            let accent = art::accent(&bgra);
-            self.covers.insert(url, (bgra, accent));
+            self.covers.insert(url, bgra);
         }
     }
 
-    /// 枠に描く内容。まだ 1 曲も取れていなければ None(枠だけ出る)。
-    fn view(&self) -> Option<MelonView<'_>> {
-        let chart = self.current()?;
-        let cover = chart.art_url.as_ref().and_then(|url| self.covers.get(url));
+    /// 枠に描く内容。
+    fn view(&self) -> MelonView<'_> {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs() as i64)
             .unwrap_or(0);
-        Some(MelonView {
-            chart,
-            art: cover.map(|(bgra, _)| bgra.as_slice()),
-            accent: cover.map(|(_, a)| *a).unwrap_or_else(art::Accent::melon),
-            time: chart.time_label(now),
-        })
+        let songs = self
+            .now
+            .iter()
+            .map(|chart| MelonSong {
+                chart,
+                art: chart.art_url.as_ref().and_then(|url| self.covers.get(url)).map(Vec::as_slice),
+            })
+            .collect();
+        // 取り直し待ちの曲があると時台がずれる。新しく見せないよう古い方を出す
+        let oldest = self.now.iter().min_by(|a, b| a.time.cmp(&b.time));
+        MelonView {
+            open: self.open,
+            songs,
+            time: oldest.map(|c| c.time_label(now)).unwrap_or_default(),
+        }
     }
 }
 
@@ -233,7 +250,7 @@ fn redraw(
     phase: bool,
 ) -> (bool, Vec<Row>) {
     let view = np.view();
-    let chart = melon.and_then(Melon::view);
+    let chart = melon.map(Melon::view);
     let rows = clawd.lock().unwrap().rows(bar.clawd_cells());
     bar.draw(buf, state, view.as_ref(), chart.as_ref(), Some(&ClawdView { rows: &rows, phase }));
     (view.is_some(), rows)
@@ -511,7 +528,8 @@ fn daemon() -> Result<()> {
                 }
                 let lx = up.fx1 * screen_w as f64;
                 let ly = up.fy1 * screen_h as f64 - bar_y as f64;
-                match bar.hit(lx, ly, ctrls_shown, rows.len()) {
+                let melon_open = melon.as_ref().is_some_and(|m| m.open);
+                match bar.hit(lx, ly, ctrls_shown, rows.len(), melon_open) {
                     Some(Hit::Icon(i)) => {
                         if let Err(e) = actions::activate(&actions::ICONS[i], &state) {
                             eprintln!("task-var: {} の起動に失敗: {e:#}", actions::ICONS[i].name);
@@ -523,10 +541,10 @@ fn daemon() -> Result<()> {
                             eprintln!("task-var: {} の起動に失敗: {e:#}", def.name);
                         }
                     }
+                    // 札を押したら広げて順位を見せ、広げた枠を押したら札に戻す
                     Some(Hit::Melon) => {
-                        let def = actions::melon();
-                        if let Err(e) = actions::activate(def, &state) {
-                            eprintln!("task-var: {} の起動に失敗: {e:#}", def.name);
+                        if let Some(m) = melon.as_mut() {
+                            m.open = !m.open;
                         }
                     }
                     Some(Hit::Clawd(i)) => {
