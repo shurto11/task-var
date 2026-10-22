@@ -90,7 +90,7 @@ spotatui が `/tmp/spotatui_np.json` に書く情報を 2 行 3 列で表示す�
 ### Melon 枠(clawd 枠とアイコン列の間)
 
 追っている曲の Melon TOP100 での順位を出す。既定は NMIXX の
-「긴 소원 (Birthday Wish)」「Blue Valentine」「Heavy Serenade」の 3 曲で、
+「긴 소원 (Birthday Wish)」「Heavy Serenade」「Blue Valentine」の 3 曲で、
 広げるとこの順に左から並ぶ。
 
 普段は白地に Melon のロゴ(公式アプリアイコンの緑の o)を置いた正方形の札
@@ -249,7 +249,7 @@ TASKVAR_BAR_H=88 scripts/restart.sh
 | 変数 | 既定 | 内容 |
 |------|------|------|
 | `TASKVAR_MELON_W` | 札の高さ(正方形。64px バーで 56px) | 普段の札の幅。16px 未満(`0` など)で枠ごと出さない。広げた枠は clawd 枠の左端から札の右端まで |
-| `TASKVAR_MELON_SONGS` | `603442244,600243411,601879407` | 追う曲の Melon の songId(カンマ区切り。並びが左から並べる順番) |
+| `TASKVAR_MELON_SONGS` | `603442244,601879407,600243411` | 追う曲の Melon の songId(カンマ区切り。並びが左から並べる順番) |
 
 ## 開発
 

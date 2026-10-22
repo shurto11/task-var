@@ -18,9 +18,9 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// 既定で追う曲(Melon の songId)。並びが枠に左から並べる順番。
-/// NMIXX「긴 소원 (Birthday Wish)」「Blue Valentine」「Heavy Serenade」。
+/// NMIXX「긴 소원 (Birthday Wish)」「Heavy Serenade」「Blue Valentine」。
 /// `TASKVAR_MELON_SONGS`(カンマ区切り)で変えられる。
-const SONG_IDS: [&str; 3] = ["603442244", "600243411", "601879407"];
+const SONG_IDS: [&str; 3] = ["603442244", "601879407", "600243411"];
 const BASE: &str = "https://guyso.me/chart/melon/top100/trend/ranking";
 /// UA が無いと弾かれる。
 const UA: &str = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko)";
