@@ -21,7 +21,7 @@
 //! (clawd 枠の上へ)広がり、追っている曲を アルバムアート + 順位・前の時台からの
 //! 動き で横に並べる。右端に集計の時台。
 
-use crate::actions::{IconDef, ICONS};
+use crate::actions::{Icon, Icons};
 use crate::art::Accent;
 use crate::clawd::{Row, St};
 use crate::icons::{self, Glyph, Logo};
@@ -645,6 +645,8 @@ pub struct Bar {
     /// 下線の上端 y(白円の下端から `MARK_GAP` ぶん下)。
     mark_y: u32,
     glyphs: Vec<Glyph>,
+    /// アイコンの定義(icons.toml)。`xs` / `glyphs` と同じ順。
+    icons: Icons,
     ctrl: Vec<Glyph>,
     art_fallback: Glyph,
     font: Option<Font>,
@@ -658,22 +660,23 @@ pub struct Bar {
 }
 
 impl Bar {
-    pub fn new(w: u32, h: u32) -> Result<Self> {
+    pub fn new(w: u32, h: u32, icons: Icons) -> Result<Self> {
         let gap = env_u32("TASKVAR_GAP", 24);
         // 左右端の余白は共通(左は clawd 枠、右は再生情報パネルが接する)。
         let margin = env_u32("TASKVAR_MARGIN", MARGIN);
         // アイコンの大きさは `TASKVAR_ICON_D`、無指定ならバー高さ `TASKVAR_BAR_H`
         // (main.rs)から比で決まる。どちらもバーと左右の枠に収まるところで頭打ち。
         let want_d = env_u32("TASKVAR_ICON_D", h * ICON_D_PCT / 100);
-        let tile_d = icon_d(w, h, want_d, gap, margin);
-        let n = ICONS.len() as u32;
-        let total = n * tile_d + (n - 1) * gap;
+        let n = icons.list.len() as u32;
+        let tile_d = icon_d(w, h, want_d, gap, margin, n);
+        let total = n * tile_d + n.saturating_sub(1) * gap;
         // 縦は「白円 + 余白 + 下線」をひと塊にして中央へ置く。
         let block_h = tile_d + MARK_GAP + MARK_H;
         let tile_y = h.saturating_sub(block_h) / 2;
         let mark_y = tile_y + tile_d + MARK_GAP;
         let glyph_px = (tile_d * ICON_GLYPH_PCT / 100).max(1);
-        let glyphs = ICONS.iter().map(|d| icons::render(d.svg, glyph_px)).collect::<Result<_>>()?;
+        // 画像を読めないアイコンも白円だけで残す(タップ先はずれない)
+        let glyphs = icons.list.iter().map(|i| glyph_or_blank(i, glyph_px)).collect();
 
         // 左から clawd 枠・Melon 枠・アイコン列・再生情報パネルの順。幅は
         // 「パネル → 同じ幅を clawd 枠と Melon 枠で分ける → 残りにアイコン列」の
@@ -723,8 +726,7 @@ impl Bar {
                 icons::render(svg, px.max(1))
             })
             .collect::<Result<_>>()?;
-        let art_fallback =
-            icons::render(crate::actions::SPOTIFY.svg, (np.art.w * 55 / 100).max(1))?;
+        let art_fallback = glyph_or_blank(&icons.spotify, (np.art.w * 55 / 100).max(1));
 
         // アイコン列は左の枠(Melon 枠、無ければ clawd 枠)と再生情報パネルの間の
         // 中央。どちらも出せなかったときはバーの左端からの残り全部を間とみなす。
@@ -755,6 +757,7 @@ impl Bar {
             tile_y,
             mark_y,
             glyphs,
+            icons,
             ctrl,
             art_fallback,
             font: Font::load(),
@@ -764,6 +767,11 @@ impl Bar {
             melon_logo,
             sprite,
         })
+    }
+
+    /// アイコンの定義。`Hit::Icon(i)` の i はこの `list` の添字。
+    pub fn icons(&self) -> &Icons {
+        &self.icons
     }
 
     /// clawd 枠に並べられる個数(行数 x 列数)。
@@ -812,8 +820,8 @@ impl Bar {
         for &x0 in &self.xs {
             self.draw_shadow(buf, x0);
         }
-        for (i, def) in ICONS.iter().enumerate() {
-            self.draw_tile(buf, self.xs[i], mark(def, state), &self.glyphs[i]);
+        for (i, icon) in self.icons.list.iter().enumerate() {
+            self.draw_tile(buf, self.xs[i], mark(icon, &self.icons, state), &self.glyphs[i]);
         }
         match np {
             Some(view) => self.draw_np(buf, view),
@@ -1392,15 +1400,24 @@ impl Mark {
 /// 白円の直径を決める。`want` は `TASKVAR_ICON_D`(無指定ならバー高さ比)。
 /// 縦は「円 + 余白 + 下線」がバーに収まるところまで、横はアイコン列を並べても
 /// 左右の枠に `NP_MIN_W` ずつ残るところまでで頭打ちにする。
-fn icon_d(w: u32, h: u32, want: u32, gap: u32, margin: u32) -> u32 {
-    let n = ICONS.len() as u32;
+/// `n` はアイコンの個数(0 でもよい)。
+fn icon_d(w: u32, h: u32, want: u32, gap: u32, margin: u32, n: u32) -> u32 {
+    let n = n.max(1);
     let by_h = h.saturating_sub(MARK_GAP + MARK_H);
     let room = w.saturating_sub(margin * 2 + GAP * 2 + NP_MIN_W * 2 + (n - 1) * gap);
     want.min(by_h).min(room / n).max(ICON_D_MIN)
 }
 
-fn mark(def: &IconDef, state: &State) -> Mark {
-    match def.session {
+/// アイコンの画像を描く。読めなければ理由をログへ出して何も描かないグリフにする。
+fn glyph_or_blank(icon: &Icon, px: u32) -> Glyph {
+    icons::load(&icon.image, px).unwrap_or_else(|e| {
+        eprintln!("task-var: {} の画像を読めません(白円だけにします): {e:#}", icon.name);
+        icons::blank(px)
+    })
+}
+
+fn mark(icon: &Icon, icons: &Icons, state: &State) -> Mark {
+    match icon.session() {
         Some(sess) => {
             if state.current.as_deref() == Some(sess) {
                 Mark::Active
@@ -1410,27 +1427,38 @@ fn mark(def: &IconDef, state: &State) -> Mark {
                 Mark::None
             }
         }
-        // tmux アイコン: 名前付きセッション以外(=通常の作業セッション)を表示中なら水色。
-        // spotify はアイコン列に居ないが名前付きセッションではあるので数に入れる。
-        // tmux スイッチャーは閉じることが無いので、下線が消えることはない
+        // window のアイコン(tmux): 名前付きセッション以外(=通常の作業セッション)を
+        // 表示中なら水色。spotify はアイコン列に居ないが名前付きセッションではあるので
+        // 数に入れる。セッションに対応しないので下線が消えることはない
         // (名前付きセッションを見ている間は灰色になるだけ)。
-        None => {
-            let named: Vec<&str> = ICONS
-                .iter()
-                .chain([crate::actions::spotify()])
-                .filter_map(|d| d.session)
-                .collect();
-            match state.current.as_deref() {
-                Some(cur) if !named.contains(&cur) => Mark::Active,
-                _ => Mark::Open,
-            }
-        }
+        None => match state.current.as_deref() {
+            Some(cur) if !icons.sessions().any(|s| s == cur) => Mark::Active,
+            _ => Mark::Open,
+        },
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// テスト用のアイコン定義。icons.toml を書き換えてもテストが揺れないよう固定する。
+    /// 並びは [tmux(window), shorts, bluetooth, fbrowse, eduroam, calendar, drmterm]。
+    fn icons() -> Icons {
+        let mut text = String::new();
+        for name in ["tmux", "shorts", "bluetooth", "fbrowse", "eduroam", "calendar", "drmterm"] {
+            let window = name == "tmux";
+            text += &format!(
+                "[[icon]]\nname = \"{name}\"\nimage = \"assets/{name}.svg\"\n\
+                 command = \"true\"\nwindow = {window}\n\n"
+            );
+        }
+        text += "[spotify]\nname = \"spotify\"\nimage = \"assets/spotify.svg\"\ncommand = \"true\"\n";
+        Icons::parse(&text, std::path::Path::new(env!("CARGO_MANIFEST_DIR"))).unwrap()
+    }
+
+    /// テスト用の定義のアイコンの数。
+    const N_ICONS: u32 = 7;
 
     fn state(current: &str, existing: &[&str]) -> State {
         State {
@@ -1475,21 +1503,23 @@ mod tests {
 
     #[test]
     fn marks_follow_session_state() {
-        // ICONS: [tmux, shorts, bluetooth, fbrowse, eduroam, calendar, drmterm]
+        // [tmux, shorts, bluetooth, fbrowse, eduroam, calendar, drmterm]
         // (spotify は再生情報パネルが受け持つのでアイコン列には並べない)
+        let ic = icons();
+        let mark = |k: usize, st: &State| mark(&ic.list[k], &ic, st);
         let st = state("bluetooth", &["bluetooth", "shorts"]);
-        assert_eq!(mark(&ICONS[2], &st), Mark::Active, "表示中は水色");
-        assert_eq!(mark(&ICONS[1], &st), Mark::Open, "存在するが非表示は灰色");
-        assert_eq!(mark(&ICONS[3], &st), Mark::None, "セッション無しは下線なし");
-        assert_eq!(mark(&ICONS[0], &st), Mark::Open, "名前付きセッション表示中のtmuxは灰色");
+        assert_eq!(mark(2, &st), Mark::Active, "表示中は水色");
+        assert_eq!(mark(1, &st), Mark::Open, "存在するが非表示は灰色");
+        assert_eq!(mark(3, &st), Mark::None, "セッション無しは下線なし");
+        assert_eq!(mark(0, &st), Mark::Open, "名前付きセッション表示中のtmuxは灰色");
         // spotify も名前付きセッション。アイコンが無くても tmux は灰色のまま
         let sp = state("spotify", &["spotify"]);
-        assert_eq!(mark(&ICONS[0], &sp), Mark::Open, "spotify 表示中のtmuxは灰色");
+        assert_eq!(mark(0, &sp), Mark::Open, "spotify 表示中のtmuxは灰色");
         let st2 = state("main", &["main", "spotify"]);
-        assert_eq!(mark(&ICONS[0], &st2), Mark::Active, "通常セッション表示中のtmuxは水色");
+        assert_eq!(mark(0, &st2), Mark::Active, "通常セッション表示中のtmuxは水色");
         // tmux アイコンだけは、どの状態でも下線が消えない
         for cur in ["main", "spotify", "bluetooth"] {
-            assert_ne!(mark(&ICONS[0], &state(cur, &[cur])), Mark::None, "tmux の下線が消えた");
+            assert_ne!(mark(0, &state(cur, &[cur])), Mark::None, "tmux の下線が消えた");
         }
     }
 
@@ -1504,25 +1534,25 @@ mod tests {
     fn icon_size_follows_the_bar_height() {
         // 無指定ならバー高さ比。既定の 88px バーでは従来どおり 64px
         let want = |h: u32| h * ICON_D_PCT / 100;
-        assert_eq!(icon_d(1366, 88, want(88), 24, MARGIN), 64);
-        assert_eq!(icon_d(1366, 128, want(128), 24, MARGIN), 93, "バーを高くすると育つ");
-        assert_eq!(icon_d(1366, 48, want(48), 24, MARGIN), 35, "バーを低くすると縮む");
+        assert_eq!(icon_d(1366, 88, want(88), 24, MARGIN, N_ICONS), 64);
+        assert_eq!(icon_d(1366, 128, want(128), 24, MARGIN, N_ICONS), 93, "バーを高くすると育つ");
+        assert_eq!(icon_d(1366, 48, want(48), 24, MARGIN, N_ICONS), 35, "バーを低くすると縮む");
 
         // 縦は「円 + 余白 + 下線」がバーに収まるところまで
         for h in [24u32, 40, 88, 200] {
-            let d = icon_d(1366, h, 9999, 24, MARGIN);
+            let d = icon_d(1366, h, 9999, 24, MARGIN, N_ICONS);
             assert!(d + MARK_GAP + MARK_H <= h, "h={h} で下線がバーからはみ出す");
         }
         // 横は、アイコン列を並べても左右の枠に NP_MIN_W ずつ残るところまで
-        let d = icon_d(1366, 400, 9999, 24, MARGIN);
-        let n = ICONS.len() as u32;
+        let d = icon_d(1366, 400, 9999, 24, MARGIN, N_ICONS);
+        let n = N_ICONS;
         let total = n * d + (n - 1) * 24;
         assert!(
             total + MARGIN * 2 + GAP * 2 + NP_MIN_W * 2 <= 1366,
             "アイコン列が枠の場所を食っている: total={total}"
         );
         // 下限は割り込まない(狭い画面でもアイコンは残す)
-        assert_eq!(icon_d(320, 88, want(88), 24, MARGIN), ICON_D_MIN);
+        assert_eq!(icon_d(320, 88, want(88), 24, MARGIN, N_ICONS), ICON_D_MIN);
     }
 
     #[test]
@@ -1536,13 +1566,36 @@ mod tests {
     }
 
     #[test]
+    fn bar_survives_no_icons_and_unreadable_images() {
+        // icons.toml を書き換えた結果でもバーは落ちない
+        let base = std::path::Path::new("/nonexistent");
+        let spotify = "[spotify]\nname = \"spotify\"\nimage = \"none.svg\"\ncommand = \"true\"\n";
+        let (w, h) = (1366, 64);
+        let mut buf = vec![0u8; (w * h * 4) as usize];
+
+        // アイコン無し: 列が空になるだけ
+        let bar = Bar::new(w, h, Icons::parse(spotify, base).unwrap()).unwrap();
+        assert!(bar.xs.is_empty());
+        bar.draw(&mut buf, &state("main", &["main"]), None, None, None);
+
+        // 画像が読めないアイコンは白円だけで残り、押せば当たる
+        let one = format!("[[icon]]\nname = \"x\"\nimage = \"none.png\"\ncommand = \"true\"\n{spotify}");
+        let bar = Bar::new(w, h, Icons::parse(&one, base).unwrap()).unwrap();
+        bar.draw(&mut buf, &state("main", &["main"]), None, None, None);
+        let (cx, cy) = (bar.xs[0] + bar.tile_d / 2, bar.tile_y + bar.tile_d / 2);
+        let off = ((cy * w + cx) * 4) as usize;
+        assert_eq!(buf[off..off + 3], WHITE, "白円の真ん中は白のまま");
+        assert_eq!(bar.hit(cx as f64, cy as f64, false, 0, false), Some(Hit::Icon(0)));
+    }
+
+    #[test]
     fn layout_survives_any_bar_height() {
         // TASKVAR_BAR_H は 24px〜画面の半分まで動かせる(main.rs)。
         // どの高さでも組み立てと描画が成立し、アイコン列が左右の枠と重ならない。
         let w = 1366;
         let heights = (24..=200).step_by(8).chain([256, 384]);
         for h in heights {
-            let bar = Bar::new(w, h).unwrap();
+            let bar = Bar::new(w, h, icons()).unwrap();
             let mut buf = vec![0u8; (w * h * 4) as usize];
             let np = now_playing();
             let view = NpView {
@@ -1563,7 +1616,7 @@ mod tests {
             // 白円 + 下線はバーの中に収まる
             assert!(bar.mark_y + MARK_H <= h, "h={h} で下線がバーの外");
             // アイコン列は左の clawd 枠と右のパネルに重ならない
-            let icons_right = bar.xs[ICONS.len() - 1] + bar.tile_d;
+            let icons_right = bar.xs[bar.icons.list.len() - 1] + bar.tile_d;
             assert!(icons_right <= bar.np_rect().x, "h={h} でパネルに重なった");
             if let Some(l) = &bar.clawd {
                 assert!(l.panel.x + l.panel.w <= bar.xs[0], "h={h} で clawd 枠に重なった");
@@ -1597,7 +1650,7 @@ mod tests {
     fn draw_and_hit() {
         // 実機と同じ 1366x64(既定の TASKVAR_BAR_H。fbterm のセル高 16px の倍数)
         let (w, h) = (1366u32, 64u32);
-        let bar = Bar::new(w, h).unwrap();
+        let bar = Bar::new(w, h, icons()).unwrap();
         let mut buf = vec![0u8; (w * h * 4) as usize];
         // shorts=表示中(水色) / bluetooth=開いているだけ(灰色) / 他=下線なし
         let st = state("shorts", &["shorts", "bluetooth"]);
@@ -1642,7 +1695,7 @@ mod tests {
         assert_eq!(mark_px(&buf, &bar, 0, 0), GRAY, "tmux の下線が消えている");
 
         // アイコン列は左の枠(clawd 枠 + Melon 枠)とパネルの間の中央。左右の余りが揃っている
-        let icons_right = bar.xs[ICONS.len() - 1] + bar.tile_d;
+        let icons_right = bar.xs[bar.icons.list.len() - 1] + bar.tile_d;
         let l = bar.clawd.as_ref().unwrap();
         let m = bar.melon.as_ref().unwrap().logo;
         let left_gap = bar.xs[0] - (m.x + m.w);
@@ -1764,7 +1817,7 @@ mod tests {
     #[test]
     fn empty_panel_keeps_the_frame_and_the_spotify_icon() {
         let (w, h) = (1366u32, 96u32);
-        let bar = Bar::new(w, h).unwrap();
+        let bar = Bar::new(w, h, icons()).unwrap();
         let mut buf = vec![0u8; (w * h * 4) as usize];
         bar.draw(&mut buf, &state("spotify", &["spotify"]), None, None, None);
         let px = |x: u32, y: u32| -> [u8; 3] {
@@ -1816,7 +1869,7 @@ mod tests {
 
     #[test]
     fn clawd_frame_sits_left_of_the_icons() {
-        let bar = Bar::new(1366, 64).unwrap();
+        let bar = Bar::new(1366, 64, icons()).unwrap();
         assert_eq!(bar.clawd_cells(), CLAWD_ROWS * CLAWD_COLS, "既定は 2 行 2 列");
         let l = bar.clawd.as_ref().unwrap();
 
@@ -1832,7 +1885,7 @@ mod tests {
         assert_eq!(l.panel.y, np.y, "上の余白が違う");
         assert_eq!(l.panel.h, np.h, "高さが違う");
         assert!(m.x + m.w <= bar.xs[0], "アイコン列に重なっている");
-        let icons_right = bar.xs[ICONS.len() - 1] + bar.tile_d;
+        let icons_right = bar.xs[bar.icons.list.len() - 1] + bar.tile_d;
         assert!(icons_right <= bar.np_rect().x, "アイコン列が再生情報パネルに重なっている");
         assert_eq!(bar.clawd_rect(), Some(l.panel));
 
@@ -1873,7 +1926,7 @@ mod tests {
     #[test]
     fn clawd_cells_draw_and_hit() {
         let (w, h) = (1366u32, 64u32);
-        let bar = Bar::new(w, h).unwrap();
+        let bar = Bar::new(w, h, icons()).unwrap();
         let mut buf = vec![0u8; (w * h * 4) as usize];
         let st = state("main", &["main"]);
         let rows = vec![
@@ -1944,7 +1997,7 @@ mod tests {
     #[test]
     fn the_label_takes_the_empty_column_next_to_it() {
         let (w, h) = (1366u32, 64u32);
-        let bar = Bar::new(w, h).unwrap();
+        let bar = Bar::new(w, h, icons()).unwrap();
         let l = bar.clawd.as_ref().unwrap();
         let st = state("main", &["main"]);
         // 1 セルの幅には到底入らない見出し
@@ -2086,7 +2139,7 @@ mod tests {
     #[test]
     fn melon_frame_is_a_logo_card_until_tapped() {
         let (w, h) = (1366u32, 64u32);
-        let bar = Bar::new(w, h).unwrap();
+        let bar = Bar::new(w, h, icons()).unwrap();
         let l = bar.melon.as_ref().unwrap();
         let p = l.logo;
         // 札は正方形。空いたぶんは clawd 枠に回る(clawd 枠 + 札で再生情報パネルと同じ幅)
@@ -2149,7 +2202,7 @@ mod tests {
     #[test]
     fn melon_frame_opens_over_the_clawd_frame_to_show_every_song() {
         let (w, h) = (1366u32, 64u32);
-        let bar = Bar::new(w, h).unwrap();
+        let bar = Bar::new(w, h, icons()).unwrap();
         let l = bar.melon.as_ref().unwrap();
         let o = l.open;
         let c = bar.clawd.as_ref().unwrap().panel;

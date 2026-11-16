@@ -1,7 +1,8 @@
 //! task-var: フレームバッファ画面下部にセッション切替タスクバーを表示する。
 //!
-//! - 左側に白円アイコン(tmux / Spotify / YouTube Shorts / Bluetooth / fbrowse /
-//!   eduroam / カレンダー / drmterm)を横一列に表示
+//! - 中央に白円アイコン(既定は tmux / YouTube Shorts / Bluetooth / fbrowse /
+//!   eduroam / カレンダー / drmterm)を横一列に表示。並べるアイコンと名前・コマンド・
+//!   画像はリポジトリ直下の icons.toml に書き、保存すると 1 秒以内に反映される
 //! - 右側に Spotify の再生情報パネル(アルバムアート・曲名・アーティスト・
 //!   操作ボタン 5 個・進捗バー)を表示する。表示データは spotatui が書く
 //!   `/tmp/spotatui_np.json`、操作とシャッフル/リピート状態は MPRIS。
@@ -293,6 +294,37 @@ fn main() -> Result<()> {
     }
 }
 
+/// icons.toml を読み直して組み直したバーを返す。書き間違い・アートの大きさが
+/// 変わる(=再起動が要る)ときは理由をログへ出して None(前のバーのまま続ける)。
+fn reload_icons(bar: &Bar, path: &std::path::Path, w: u32, h: u32) -> Option<Bar> {
+    let icons = match actions::Icons::load(path) {
+        // 定義が同じでも画像が差し替わっていることがあるので、毎回組み直す
+        Ok(icons) => icons,
+        Err(e) => {
+            eprintln!("task-var: アイコンの定義を読み直せません(前の定義のまま): {e:#}");
+            return None;
+        }
+    };
+    let n = icons.list.len();
+    let new = match Bar::new(w, h, icons) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("task-var: アイコンの定義からバーを組めません(前の定義のまま): {e:#}");
+            return None;
+        }
+    };
+    // アルバムアートは取得スレッドが起動時の大きさで焼くので、そこが動くなら作り直せない
+    if new.art_side() != bar.art_side() || new.melon_art_side() != bar.melon_art_side() {
+        eprintln!(
+            "task-var: アイコンの数でアルバムアートの大きさが変わるので、\
+             反映には再起動が要ります(scripts/restart.sh)"
+        );
+        return None;
+    }
+    eprintln!("task-var: アイコンの定義を読み直しました({n} 個)");
+    Some(new)
+}
+
 fn daemon() -> Result<()> {
     let fb = fb::Framebuffer::open()?;
     let (screen_w, screen_h) = (fb.width, fb.height);
@@ -327,7 +359,10 @@ fn daemon() -> Result<()> {
         });
     }
 
-    let bar = Bar::new(screen_w, bar_h)?;
+    // アイコンの定義(icons.toml)。1 秒ごとに更新時刻を見て、変わっていれば組み直す。
+    let icons_path = actions::Icons::path();
+    let mut bar = Bar::new(screen_w, bar_h, actions::Icons::load_at_start(&icons_path))?;
+    let mut icons_stamp = bar.icons().stamp(&icons_path);
     let mut buf = vec![0u8; (screen_w * bar_h * 4) as usize];
     let mut state = tmux::State::poll();
 
@@ -394,6 +429,7 @@ fn daemon() -> Result<()> {
     let mut hide_at: Option<Instant> = None; // スワイプ表示の自動非表示期限
     let mut last_poll = Instant::now();
     let mut last_full = Instant::now();
+    let mut full_now = false; // 次の描画で間隔を待たずに全面ブリットする
     // 初期状態を描画(通常モードで可視)
     fb.blit(0, bar_y, screen_w, bar_h, &buf)?;
 
@@ -531,14 +567,15 @@ fn daemon() -> Result<()> {
                 let melon_open = melon.as_ref().is_some_and(|m| m.open);
                 match bar.hit(lx, ly, ctrls_shown, rows.len(), melon_open) {
                     Some(Hit::Icon(i)) => {
-                        if let Err(e) = actions::activate(&actions::ICONS[i], &state) {
-                            eprintln!("task-var: {} の起動に失敗: {e:#}", actions::ICONS[i].name);
+                        let icon = &bar.icons().list[i];
+                        if let Err(e) = actions::activate(icon, &state) {
+                            eprintln!("task-var: {} の起動に失敗: {e:#}", icon.name);
                         }
                     }
                     Some(Hit::Panel) => {
-                        let def = actions::spotify();
-                        if let Err(e) = actions::activate(def, &state) {
-                            eprintln!("task-var: {} の起動に失敗: {e:#}", def.name);
+                        let icon = &bar.icons().spotify;
+                        if let Err(e) = actions::activate(icon, &state) {
+                            eprintln!("task-var: {} の起動に失敗: {e:#}", icon.name);
                         }
                     }
                     // 札を押したら広げて順位を見せ、広げた枠を押したら札に戻す
@@ -630,6 +667,18 @@ fn daemon() -> Result<()> {
                     }
                     // 消えたペインの掃除とセッション名の更新も同じ間隔で行う。
                     clawd::refresh(&clawd_model);
+
+                    // icons.toml(か画像)が書き換えられていたら読み直してバーを組み直す。
+                    let stamp = bar.icons().stamp(&icons_path);
+                    if stamp != icons_stamp {
+                        icons_stamp = stamp;
+                        if let Some(b) = reload_icons(&bar, &icons_path, screen_w, bar_h) {
+                            bar = b;
+                            icons_stamp = bar.icons().stamp(&icons_path);
+                            // アイコンの位置が動くので、次の描画で全面を描き直す
+                            full_now = true;
+                        }
+                    }
                 }
                 // 再生情報は毎ティック取り込んで描き直す(進捗バーを進めるため)。
                 // Melon 枠も同じついでに取り込む(新しい時台は全面ブリットで出る)。
@@ -651,9 +700,10 @@ fn daemon() -> Result<()> {
                     // 全面ブリットは 1 秒に 1 回(fbterm/fbhalf の再描画で消された
                     // ときの復活用)。その合間はパネル部分だけを部分ブリットして
                     // /dev/fb0 への書き込み量を抑える。
-                    if last_full.elapsed() >= FULL_BLIT_EVERY {
+                    if full_now || last_full.elapsed() >= FULL_BLIT_EVERY {
                         fb.blit(0, bar_y, screen_w, bar_h, &buf)?;
                         last_full = Instant::now();
+                        full_now = false;
                     } else {
                         if ctrls_shown {
                             let r = bar.np_rect();

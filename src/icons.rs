@@ -1,12 +1,16 @@
-//! Simple Icons の SVG(assets/ に fetch-icons.sh でダウンロード、ビルド時に埋め込み)を
-//! resvg でレンダリングする。cdn.simpleicons.org の SVG はブランドカラーの fill 付きなので
-//! そのまま描けばカラーになる。
+//! アイコンの画像を描く。
+//!
+//! アイコン列の画像は icons.toml に書かれたパスを実行時に読む(`load`)。SVG は resvg で、
+//! PNG / JPEG は image で縮めて描く。Simple Icons の SVG(cdn.simpleicons.org)は
+//! ブランドカラーの fill 付きなので、そのまま描けばカラーになる。
+//! 操作ボタンの SVG(bar.rs)はビルド時に埋め込んで `render` へ渡す。
 //!
 //! Melon のロゴだけは商標をリポジトリに含めないため埋め込まず、
 //! fetch-melon-logo.sh が落とした PNG を実行時に読む(`load_logo`)。
 
 use anyhow::{Context, Result};
 use resvg::{tiny_skia, usvg};
+use std::path::Path;
 
 /// レンダリング済みグリフ。`rgba` は px*px*4 バイトのプリマルチプライドRGBA。
 pub struct Glyph {
@@ -57,6 +61,36 @@ pub fn load_logo(path: &str, max_w: u32, max_h: u32) -> Result<Logo> {
     Ok(Logo { w: lw, h: lh, rgba })
 }
 
+/// 画像ファイルを px×px に収まるよう縦横比を保って描き、中央へ寄せる。
+/// 拡張子が .svg なら SVG、それ以外は PNG / JPEG として読む。
+pub fn load(path: &Path, px: u32) -> Result<Glyph> {
+    let svg = path.extension().is_some_and(|e| e.eq_ignore_ascii_case("svg"));
+    if svg {
+        let data = std::fs::read(path).with_context(|| format!("{} を開けない", path.display()))?;
+        return render(&data, px).with_context(|| path.display().to_string());
+    }
+    let img = image::open(path).with_context(|| format!("{} を開けない", path.display()))?.to_rgba8();
+    let (w, h) = img.dimensions();
+    let scale = (px as f32 / w as f32).min(px as f32 / h as f32);
+    let sw = ((w as f32 * scale).round() as u32).clamp(1, px);
+    let sh = ((h as f32 * scale).round() as u32).clamp(1, px);
+    let scaled = image::imageops::resize(&img, sw, sh, image::imageops::FilterType::Lanczos3);
+    let (ox, oy) = ((px - sw) / 2, (px - sh) / 2);
+    let mut rgba = vec![0u8; (px * px * 4) as usize];
+    for (x, y, p) in scaled.enumerate_pixels() {
+        let [r, g, b, a] = p.0;
+        let pm = |c: u8| (c as u32 * a as u32 / 255) as u8;
+        let off = (((oy + y) * px + ox + x) * 4) as usize;
+        rgba[off..off + 4].copy_from_slice(&[pm(r), pm(g), pm(b), a]);
+    }
+    Ok(Glyph { px, rgba })
+}
+
+/// 何も描かないグリフ。画像を読めなかったアイコンに使う(白円だけになる)。
+pub fn blank(px: u32) -> Glyph {
+    Glyph { px, rgba: vec![0; (px * px * 4) as usize] }
+}
+
 /// SVG を px×px に収まるようアスペクト維持でレンダリングして中央寄せする。
 pub fn render(svg: &[u8], px: u32) -> Result<Glyph> {
     let opt = usvg::Options::default();
@@ -103,5 +137,25 @@ mod tests {
 
         // 無いファイルはエラー(呼び手が札を白地だけにする)
         assert!(load_logo("/nonexistent/melon.png", 10, 10).is_err());
+    }
+
+    #[test]
+    fn load_fits_a_png_into_the_square_and_centers_it() {
+        // 横長 20x10 の赤 → 10x10 の箱では 10x5 になり、上下に 2〜3px ずつ透明が残る
+        let img = image::RgbaImage::from_pixel(20, 10, image::Rgba([255, 0, 0, 255]));
+        let path = std::env::temp_dir().join(format!("task-var-icon-{}.png", std::process::id()));
+        img.save(&path).unwrap();
+
+        let g = load(&path, 10).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!((g.px, g.rgba.len()), (10, 400));
+        let at = |x: u32, y: u32| &g.rgba[((y * 10 + x) * 4) as usize..][..4];
+        assert_eq!(at(0, 5), [255, 0, 0, 255], "中央の段は端まで赤");
+        assert_eq!(at(5, 0)[3], 0, "上は透明");
+        assert_eq!(at(5, 9)[3], 0, "下も透明");
+
+        // 拡張子で SVG と見分ける。無いファイルはエラー(呼び手が白円だけにする)
+        assert!(load(Path::new("/nonexistent/x.svg"), 10).is_err());
+        assert!(load(Path::new("/nonexistent/x.png"), 10).is_err());
     }
 }

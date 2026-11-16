@@ -40,9 +40,28 @@ Melon の札をタップすると、右端を札に揃えたまま clawd 枠の�
 
 ### アイコン列(中央)
 
-tmux / YouTube Shorts / Bluetooth / fbrowse / eduroam / Google カレンダー /
+既定は tmux / YouTube Shorts / Bluetooth / fbrowse / eduroam / Google カレンダー /
 drmterm(外部モニター端末)の 7 個。タップすると対応する tmux セッションへ遷移し、無ければ作ってから
 プログラムを起動する。
+
+並べるアイコンはリポジトリ直下の [`icons.toml`](icons.toml) に書く。1 個につき
+名前(= tmux のセッション名)・画像・コマンドの 3 つで、書いた順に左から並ぶ。
+
+```toml
+[[icon]]
+name = "bluetooth"              # tmux のセッション名
+image = "assets/bluetooth.svg"  # SVG / PNG / JPEG。相対パスは icons.toml の場所から
+command = "bluetoothctl"        # セッションを作ったときに実行する(シェル経由なので ~ や && が使える)
+```
+
+保存すると 1 秒以内にバーへ反映される(再起動もビルドも要らない)。画像ファイルを
+差し替えただけでも反映される。書き間違いがあれば反映せずに前の定義のまま動き続け、
+理由(行番号つき)をログに出す。`window = true` を付けたアイコン(tmux)は
+セッションを作らず、表示中のセッションに新しいウィンドウを開いてコマンドを実行する。
+再生情報パネルの遷移先(spotatui)も同じファイルの `[spotify]` に書く。
+
+アイコンの数を増やしすぎて再生情報パネルが狭まり、アルバムアートの大きさまで変わる
+ときだけは、その場では反映できないので `scripts/restart.sh` で再起動する(ログに出る)。
 
 白円の下の横線がセッションの状態を表す。
 
@@ -211,6 +230,7 @@ TASKVAR_BAR_H=88 scripts/restart.sh
 
 | 変数 | 既定 | 内容 |
 |------|------|------|
+| `TASKVAR_ICONS` | リポジトリの `icons.toml` | アイコンの定義ファイルの場所 |
 | `TASKVAR_ICON_D` | バー高の 73% | 白円の直径。下限 16px |
 | `TASKVAR_GAP` | 24px | アイコン同士の間隔 |
 
@@ -254,9 +274,12 @@ TASKVAR_BAR_H=88 scripts/restart.sh
 ## 開発
 
 ```bash
-cargo test        # 描画・レイアウト・当たり判定まで含めて 46 本
+cargo test        # 描画・レイアウト・当たり判定・icons.toml の検証まで含めて 51 本
 cargo build --release && scripts/restart.sh
 ```
+
+`icons.toml` を書き換えたら `cargo test` でも確かめられる
+(`builtin_icons_toml_is_valid_and_every_image_loads` が全アイコンの画像まで描いてみる)。
 
 テストは実際にバッファへ描いてピクセルを読む。バーの高さを 24px から
 384px まで舐めてレイアウトが破綻しないことも確認している

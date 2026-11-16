@@ -11,6 +11,7 @@ resvg = { version = "0.45", default-features = false }
 signal-hook = "0.3"
 ab_glyph = "0.2"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
+toml = { version = "0.8", default-features = false, features = ["parse"] }
 
 [profile.release]
 opt-level = 2
