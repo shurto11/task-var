@@ -29,11 +29,6 @@ command = "~/ssd/fb/tmux-session/target/release/tmux-session"
 window = true
 
 [[icon]]
-name = "shorts"
-image = "assets/shorts.svg"
-command = "~/ssd/claude/dopagaki/target/release/dopagaki standalone"
-
-[[icon]]
 name = "bluetooth"
 image = "assets/bluetooth.svg"
 command = "bluetoothctl"
@@ -48,6 +43,11 @@ command = "~/ssd/fb/fbrowse/target/release/fbrowse --auto"
 name = "eduroam"
 image = "assets/eduroam.svg"
 command = "bash -ic eduroam"
+
+[[icon]]
+name = "wanna"
+image = "assets/eduroam.svg"
+command = "~/ssd/tui/wanna/target/release/wanna"
 
 # calendar-tui は credentials.json をカレントディレクトリから探すので、
 # 自分のディレクトリへ cd してから起動する
