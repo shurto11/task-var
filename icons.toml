@@ -46,7 +46,7 @@ command = "bash -ic eduroam"
 
 [[icon]]
 name = "wanna"
-image = "assets/eduroam.svg"
+image = "assets/wanna.svg"
 command = "~/ssd/tui/wanna/target/release/wanna"
 
 # calendar-tui は credentials.json をカレントディレクトリから探すので、
