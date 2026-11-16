@@ -9,6 +9,8 @@
 //! - それ以外は「セッションがあれば switch のみ / なければ作成してコマンド実行 → switch」。
 //! - Spotify は再生情報パネル(bar.rs)が受け持つので、アイコン列には並べず
 //!   `[spotify]` として別に持つ。パネルのタップとアート未取得時の絵がこれを引く。
+//! - Melon 枠(追っている曲の TOP100 順位)は `[melon]` に書く。節ごと無ければ
+//!   (コメントアウトしたら)枠を出さない。
 
 use crate::tmux;
 use anyhow::{bail, ensure, Context, Result};
@@ -49,6 +51,17 @@ pub struct Icons {
     pub list: Vec<Icon>,
     /// 再生情報パネルの遷移先とアート未取得時の絵。
     pub spotify: Icon,
+    /// Melon 枠。None なら枠を出さない。
+    pub melon: Option<MelonDef>,
+}
+
+/// Melon 枠の定義(`[melon]`)。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MelonDef {
+    /// 札に置くロゴ(`~` と相対パスは解決済み)。読めなければ札は白地だけ。
+    pub image: PathBuf,
+    /// 追う曲の Melon の songId。並びが枠に左から並べる順番。
+    pub songs: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -57,6 +70,15 @@ struct File {
     #[serde(default)]
     icon: Vec<Entry>,
     spotify: Entry,
+    #[serde(default)]
+    melon: Option<MelonEntry>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MelonEntry {
+    image: String,
+    songs: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -102,7 +124,8 @@ impl Icons {
                 bail!("name が重なっている: {}", icon.name);
             }
         }
-        Ok(Self { list, spotify })
+        let melon = file.melon.map(|m| to_melon(m, base)).transpose().context("[melon]")?;
+        Ok(Self { list, spotify, melon })
     }
 
     /// ファイルから読む。
@@ -135,6 +158,7 @@ impl Icons {
                         command: "true".into(),
                         window: false,
                     },
+                    melon: None,
                 }
             })
     }
@@ -151,9 +175,24 @@ impl Icons {
         let mtime = |p: &Path| std::fs::metadata(p).and_then(|m| m.modified()).ok();
         std::iter::once(path)
             .chain(self.list.iter().chain([&self.spotify]).map(|i| i.image.as_path()))
+            .chain(self.melon.as_ref().map(|m| m.image.as_path()))
             .map(mtime)
             .collect()
     }
+}
+
+/// `[melon]` を確かめる。曲が 1 つも無い・songId が数字でないものは弾く
+/// (枠ごと消したいならコメントアウトする)。
+fn to_melon(m: MelonEntry, base: &Path) -> Result<MelonDef> {
+    let songs: Vec<String> = m.songs.iter().map(|s| s.trim().to_string()).collect();
+    ensure!(!songs.is_empty(), "songs が空(枠ごと消すなら [melon] をコメントアウトする)");
+    for s in &songs {
+        ensure!(
+            !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()),
+            "songId は数字だけ: {s:?}"
+        );
+    }
+    Ok(MelonDef { image: resolve(&m.image, base), songs })
 }
 
 fn home() -> String {
@@ -224,6 +263,38 @@ mod tests {
         assert_eq!(icons.list[1].image, Path::new(&home()).join("pics/shorts.png"));
         assert_eq!(icons.spotify.image, Path::new("/abs/spotify.svg"));
         assert_eq!(icons.sessions().collect::<Vec<_>>(), ["shorts", "spotify"]);
+        assert_eq!(icons.melon, None, "[melon] が無ければ Melon 枠は出さない");
+    }
+
+    #[test]
+    fn parse_reads_the_melon_section() {
+        let spotify = "[spotify]\nname = \"spotify\"\nimage = \"a.svg\"\ncommand = \"x\"\n";
+        let parse = |melon: &str| Icons::parse(&format!("{spotify}{melon}"), Path::new("/repo"));
+        let icons = parse(
+            r#"
+            [melon]
+            image = "assets/melon.png"
+            songs = [
+              "603442244",  # コメントも書ける
+              " 601879407 ",
+            ]
+            "#,
+        )
+        .unwrap();
+        let m = icons.melon.unwrap();
+        assert_eq!(m.image, Path::new("/repo/assets/melon.png"), "相対はファイルの場所から");
+        assert_eq!(m.songs, ["603442244", "601879407"], "書いた順・前後の空白は落とす");
+
+        // コメントアウトすれば None(枠ごと消える)
+        assert_eq!(parse("# [melon]\n# image = \"m.png\"\n# songs = [\"1\"]\n").unwrap().melon, None);
+
+        let err = |melon: &str| format!("{:#}", parse(melon).unwrap_err());
+        assert!(err("[melon]\nimage = \"m.png\"\nsongs = []").contains("空"));
+        assert!(err("[melon]\nimage = \"m.png\"\nsongs = [\"60344x\"]").contains("60344x"));
+        assert!(err("[melon]\nimage = \"m.png\"\nsongs = [\"\"]").contains("数字"));
+        assert!(err("[melon]\nimage = \"m.png\"").contains("songs"), "書き忘れは弾く");
+        assert!(err("[melon]\nimage = \"m.png\"\nsong = [\"1\"]").contains("song"), "綴り違いも");
+        assert!(parse("[melon]\nimage = \"m.png\"\nsongs = [603442244]").is_err(), "数値は弾く");
     }
 
     #[test]

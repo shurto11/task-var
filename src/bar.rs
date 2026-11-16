@@ -19,7 +19,8 @@
 //!
 //! Melon 枠は普段は白地に Melon のロゴを置いた細い札で、タップすると左へ
 //! (clawd 枠の上へ)広がり、追っている曲を アルバムアート + 順位・前の時台からの
-//! 動き で横に並べる。右端に集計の時台。
+//! 動き で横に並べる。右端に集計の時台。icons.toml に `[melon]` が無ければ
+//! 枠を出さず、clawd 枠が左の枠をまるごと使う。
 
 use crate::actions::{Icon, Icons};
 use crate::art::Accent;
@@ -185,14 +186,14 @@ const CLAWD_SEEN: [u8; 3] = [158, 158, 158]; // #9E9E9E
 
 // Melon 枠(追っている曲の TOP100 順位)。普段は白地にロゴだけの札で、
 // タップで広げたときだけ順位を並べる。
-/// Melon のロゴ(公式アプリアイコン。白地に緑の o)。商標なので埋め込まず、
-/// scripts/fetch-melon-logo.sh が落としたものを起動時に読む。無ければ札は白地だけ。
-const MELON_LOGO: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/assets/melon.png");
+// ロゴ(公式アプリアイコン。白地に緑の o)は商標なので埋め込まず、
+// scripts/fetch-melon-logo.sh が落としたものを icons.toml の `[melon]` の image から
+// 読む。無ければ札は白地だけ。
 /// ロゴの大きさ。札の短い辺に対する割合で、この正方形に収める。
 const MELON_LOGO_PCT: u32 = 60;
 /// 札の幅の既定は札の高さ(正方形)。clawd 枠はパネル幅から札の幅と `GAP` を
 /// 引いた残りになる。札の幅は `TASKVAR_MELON_W` で直接変えられ、
-/// `MELON_MIN_W` 未満(0 など)なら出さない。
+/// `MELON_MIN_W` 未満(0 など)なら出さない(`[melon]` が無いときも同じ)。
 const MELON_MIN_W: u32 = 16;
 /// 広げた枠のアートと順位の列の間。幅が狭いので再生情報パネルの `GAP` より詰める。
 const MELON_GAP: u32 = 8;
@@ -686,7 +687,11 @@ impl Bar {
         let np = NpLayout::new(w, h, margin, avail);
         // 左側はパネルと同じ幅(左右が揃って中央のアイコン列が引き立つ)。
         // そこから Melon 枠(普段の札。既定は正方形)の幅を先に取り、clawd 枠は残りを使う。
-        let melon_w = env_u32("TASKVAR_MELON_W", h.saturating_sub(INSET * 2)).min(np.panel.w);
+        // `[melon]` が無ければ札の幅を 0 にして、枠ごと出さない。
+        let melon_w = match &icons.melon {
+            Some(_) => env_u32("TASKVAR_MELON_W", h.saturating_sub(INSET * 2)).min(np.panel.w),
+            None => 0,
+        };
         let clawd_w = match melon_w {
             mw if mw >= MELON_MIN_W => np.panel.w.saturating_sub(mw + GAP),
             _ => np.panel.w,
@@ -699,9 +704,9 @@ impl Bar {
         };
         let melon_left_w = melon_right.saturating_sub(margin);
         let melon = MelonLayout::new(h, margin, melon_left_w, melon_w, np.artist_px);
-        let melon_logo = melon.as_ref().and_then(|l| {
+        let melon_logo = melon.as_ref().zip(icons.melon.as_ref()).and_then(|(l, def)| {
             let side = (l.logo.w.min(l.logo.h) * MELON_LOGO_PCT / 100).max(1);
-            icons::load_logo(MELON_LOGO, side, side)
+            icons::load_logo(&def.image, side, side)
                 .map_err(|e| {
                     eprintln!(
                         "task-var: Melon のロゴを読めません(札は白地だけ。\
@@ -1444,7 +1449,21 @@ mod tests {
 
     /// テスト用のアイコン定義。icons.toml を書き換えてもテストが揺れないよう固定する。
     /// 並びは [tmux(window), shorts, bluetooth, fbrowse, eduroam, calendar, drmterm]。
+    /// Melon 枠も出す。
     fn icons() -> Icons {
+        let mut icons = icons_without_melon();
+        let melon = "[melon]\nimage = \"assets/melon.png\"\nsongs = [\"603442244\"]\n";
+        let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        icons.melon = Icons::parse(&format!("{}{melon}", spotify_toml()), base).unwrap().melon;
+        icons
+    }
+
+    fn spotify_toml() -> &'static str {
+        "[spotify]\nname = \"spotify\"\nimage = \"assets/spotify.svg\"\ncommand = \"true\"\n"
+    }
+
+    /// `icons` から `[melon]` を抜いたもの(icons.toml でコメントアウトしたとき)。
+    fn icons_without_melon() -> Icons {
         let mut text = String::new();
         for name in ["tmux", "shorts", "bluetooth", "fbrowse", "eduroam", "calendar", "drmterm"] {
             let window = name == "tmux";
@@ -1453,7 +1472,7 @@ mod tests {
                  command = \"true\"\nwindow = {window}\n\n"
             );
         }
-        text += "[spotify]\nname = \"spotify\"\nimage = \"assets/spotify.svg\"\ncommand = \"true\"\n";
+        text += spotify_toml();
         Icons::parse(&text, std::path::Path::new(env!("CARGO_MANIFEST_DIR"))).unwrap()
     }
 
@@ -2197,6 +2216,34 @@ mod tests {
         let ((x0, x1), (y0, y1)) = (span(|g| g.0), span(|g| g.1));
         assert!((x0 - p.x).abs_diff(p.x + p.w - 1 - x1) <= 2, "ロゴが左右の中央にない");
         assert!((y0 - p.y).abs_diff(p.y + p.h - 1 - y1) <= 2, "ロゴが上下の中央にない");
+    }
+
+    #[test]
+    fn without_a_melon_section_the_clawd_frame_takes_the_whole_left_side() {
+        // icons.toml で [melon] をコメントアウトしたとき。札は出ず、clawd 枠が
+        // 再生情報パネルと同じ幅を使う(アイコン列の位置は変わらない)
+        let (w, h) = (1366u32, 64u32);
+        let with = Bar::new(w, h, icons()).unwrap();
+        let bar = Bar::new(w, h, icons_without_melon()).unwrap();
+        assert!(bar.melon.is_none() && bar.melon_logo.is_none());
+        assert_eq!(bar.melon_art_side(), None, "取得スレッドも起こさない");
+        let c = bar.clawd.as_ref().unwrap().panel;
+        assert_eq!(c.w, bar.np_rect().w);
+        assert_eq!(bar.xs, with.xs, "アイコン列は動かない");
+        assert_eq!(bar.art_side(), with.art_side(), "再起動なしで出し入れできる");
+
+        // 札があった場所は clawd 枠になる。広げた扱いで押しても Melon には当たらない
+        let p = with.melon.as_ref().unwrap().logo;
+        let (x, y) = ((p.x + p.w / 2) as f64, (p.y + p.h / 2) as f64);
+        assert!(c.contains(x, y));
+        assert_ne!(bar.hit(x, y, true, 4, true), Some(Hit::Melon));
+        assert_eq!(with.hit(x, y, true, 4, false), Some(Hit::Melon));
+
+        // 札は描かれない(札の真ん中が白くならない)
+        let mut buf = vec![0u8; (w * h * 4) as usize];
+        bar.draw(&mut buf, &state("main", &["main"]), None, None, None);
+        let off = ((p.y + p.h / 2) * w + p.x + 4) as usize * 4;
+        assert_ne!(buf[off..off + 3], WHITE);
     }
 
     #[test]

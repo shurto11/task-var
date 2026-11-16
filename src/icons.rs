@@ -5,8 +5,8 @@
 //! ブランドカラーの fill 付きなので、そのまま描けばカラーになる。
 //! 操作ボタンの SVG(bar.rs)はビルド時に埋め込んで `render` へ渡す。
 //!
-//! Melon のロゴだけは商標をリポジトリに含めないため埋め込まず、
-//! fetch-melon-logo.sh が落とした PNG を実行時に読む(`load_logo`)。
+//! Melon のロゴ(icons.toml の `[melon]` の image。商標なのでリポジトリには含めず、
+//! fetch-melon-logo.sh が落とす)は地を切り落として札に収める(`load_logo`)。
 
 use anyhow::{Context, Result};
 use resvg::{tiny_skia, usvg};
@@ -28,8 +28,8 @@ pub struct Logo {
 /// 地の上にロゴを置いた画像を読み、まわりの地を切り落として max_w×max_h に収まる
 /// 大きさへ(縦横比は保って)縮める。地の色は左上の画素で判断する。
 /// 地が不透明なら切り落とした内側の地もそのまま残るので、同じ色の上へ置く。
-pub fn load_logo(path: &str, max_w: u32, max_h: u32) -> Result<Logo> {
-    let img = image::open(path).with_context(|| format!("{path} を開けない"))?.to_rgba8();
+pub fn load_logo(path: &Path, max_w: u32, max_h: u32) -> Result<Logo> {
+    let img = image::open(path).with_context(|| format!("{} を開けない", path.display()))?.to_rgba8();
     let bg = *img.get_pixel(0, 0);
     let ink = |x: u32, y: u32| {
         img.get_pixel(x, y).0.iter().zip(bg.0).any(|(a, b)| a.abs_diff(b) > 8)
@@ -43,7 +43,7 @@ pub fn load_logo(path: &str, max_w: u32, max_h: u32) -> Result<Logo> {
             }
         }
     }
-    anyhow::ensure!(x0 < x1 && y0 < y1, "{path} が地の色だけでロゴが無い");
+    anyhow::ensure!(x0 < x1 && y0 < y1, "{} が地の色だけでロゴが無い", path.display());
     let (cw, ch) = (x1 - x0, y1 - y0);
     let scale = (max_w as f32 / cw as f32).min(max_h as f32 / ch as f32);
     let lw = ((cw as f32 * scale).round() as u32).clamp(1, max_w.max(1));
@@ -120,9 +120,8 @@ mod tests {
         }
         let path = std::env::temp_dir().join(format!("task-var-logo-{}.png", std::process::id()));
         img.save(&path).unwrap();
-        let path = path.to_str().unwrap();
 
-        let logo = load_logo(path, 12, 9).unwrap();
+        let logo = load_logo(&path, 12, 9).unwrap();
         assert_eq!((logo.w, logo.h), (6, 9), "縦に合わせて 8x12 → 6x9");
         assert_eq!(logo.rgba.len(), (6 * 9 * 4) as usize);
         // 地を切り落としたので、真ん中も四隅も緑(白い余白が残っていない)
@@ -132,11 +131,11 @@ mod tests {
         assert!(green(at(0, 0)) && green(at(5, 8)), "{:?} / {:?}", at(0, 0), at(5, 8));
 
         // 横長の箱なら横は余る(高さで決まる)
-        assert_eq!(load_logo(path, 100, 24).map(|l| (l.w, l.h)).unwrap(), (16, 24));
-        std::fs::remove_file(path).unwrap();
+        assert_eq!(load_logo(&path, 100, 24).map(|l| (l.w, l.h)).unwrap(), (16, 24));
+        std::fs::remove_file(&path).unwrap();
 
         // 無いファイルはエラー(呼び手が札を白地だけにする)
-        assert!(load_logo("/nonexistent/melon.png", 10, 10).is_err());
+        assert!(load_logo(Path::new("/nonexistent/melon.png"), 10, 10).is_err());
     }
 
     #[test]

@@ -10,9 +10,10 @@
 //!   最大 4 行並べる(旧 touch-claude)。状態は Claude Code の hooks が
 //!   `task-var hook-*` 経由で Unix ソケットへ送ってくる。タップでそのペインへ遷移。
 //! - clawd 枠の右隣に Melon 枠。普段は白地に Melon のロゴを置いた細い札で、
-//!   タップすると左へ広がって追っている曲(既定は NMIXX の 3 曲)の Melon TOP100
-//!   順位を並べる。広げた枠をもう 1 度押すと札に戻る(勝手には戻らない)。
-//!   順位は guyso.me から 1 時間ごとに取り直す(melon.rs)。
+//!   タップすると左へ広がって追っている曲(icons.toml の `[melon]`。既定は NMIXX の
+//!   3 曲)の Melon TOP100 順位を並べる。広げた枠をもう 1 度押すと札に戻る
+//!   (勝手には戻らない)。順位は guyso.me から 1 時間ごとに取り直す(melon.rs)。
+//!   `[melon]` をコメントアウトすると枠ごと消える(取得も止まる)。
 //! - タッチ入力は touch-server から受け取る(バー矩形を region として申告)
 //! - アイコンタップで対応 tmux セッションへ遷移(なければ作成してプログラム実行)
 //! - 通常は端末行数を縮めてバー領域を専有し、終了時に復元する(touch-key と同方式)
@@ -158,6 +159,10 @@ impl Np {
 /// ループが取り込む。枠は普段はロゴだけの札で、タップするたびに
 /// 広げる(追っている曲を全部並べる)・畳むを切り替える。
 struct Melon {
+    /// 追っている曲(icons.toml の `[melon]`)。書き換えられたら作り直す。
+    songs: Vec<String>,
+    /// アルバムアートの一辺(px)。
+    side: u32,
     shared: Arc<Mutex<Option<Vec<melon::Chart>>>>,
     art: art::Art,
     /// 取れている曲(追う順)。
@@ -173,10 +178,13 @@ struct Melon {
 
 impl Melon {
     /// 取得スレッドを起動する。`side` はアルバムアートの一辺(px)。
-    fn spawn(side: u32) -> Self {
+    /// 捨てればどちらのスレッドも止まる。
+    fn spawn(songs: Vec<String>, side: u32) -> Self {
         let shared = Arc::new(Mutex::new(None));
-        melon::spawn(shared.clone());
+        melon::spawn(songs.clone(), &shared);
         Self {
+            songs,
+            side,
             shared,
             art: art::Art::spawn(side),
             now: Vec::new(),
@@ -230,6 +238,28 @@ impl Melon {
             open: self.open,
             songs,
             time: oldest.map(|c| c.time_label(now)).unwrap_or_default(),
+        }
+    }
+}
+
+/// Melon 枠をバー(icons.toml の `[melon]`)に合わせる。枠が無くなれば捨てて
+/// 取得を止め、新しく出す・追う曲が変わったなら取得を起こし直す。
+fn sync_melon(melon: &mut Option<Melon>, bar: &Bar) {
+    let want = bar.melon_art_side().zip(bar.icons().melon.as_ref());
+    match (want, melon.as_ref()) {
+        (None, None) => {}
+        (None, Some(_)) => {
+            eprintln!("task-var: [melon] が無いので Melon 枠を消しました");
+            *melon = None;
+        }
+        (Some((side, def)), cur) => {
+            if cur.is_some_and(|m| m.side == side && m.songs == def.songs) {
+                return;
+            }
+            eprintln!("task-var: Melon 枠で {} 曲を追います: {}", def.songs.len(), def.songs.join(", "));
+            // 曲を変えただけなら、広げていた枠は広げたまま
+            let open = cur.is_some_and(|m| m.open);
+            *melon = Some(Melon { open, ..Melon::spawn(def.songs.clone(), side) });
         }
     }
 }
@@ -296,6 +326,7 @@ fn main() -> Result<()> {
 
 /// icons.toml を読み直して組み直したバーを返す。書き間違い・アートの大きさが
 /// 変わる(=再起動が要る)ときは理由をログへ出して None(前のバーのまま続ける)。
+/// Melon 枠の出し入れは呼び手が `sync_melon` で合わせる。
 fn reload_icons(bar: &Bar, path: &std::path::Path, w: u32, h: u32) -> Option<Bar> {
     let icons = match actions::Icons::load(path) {
         // 定義が同じでも画像が差し替わっていることがあるので、毎回組み直す
@@ -314,7 +345,8 @@ fn reload_icons(bar: &Bar, path: &std::path::Path, w: u32, h: u32) -> Option<Bar
         }
     };
     // アルバムアートは取得スレッドが起動時の大きさで焼くので、そこが動くなら作り直せない
-    if new.art_side() != bar.art_side() || new.melon_art_side() != bar.melon_art_side() {
+    // (Melon 枠のアートは `sync_melon` が取得スレッドごと作り直す)
+    if new.art_side() != bar.art_side() {
         eprintln!(
             "task-var: アイコンの数でアルバムアートの大きさが変わるので、\
              反映には再起動が要ります(scripts/restart.sh)"
@@ -374,8 +406,9 @@ fn daemon() -> Result<()> {
     np.refresh(&art, &player_shared);
 
     // Melon チャート: 1 時間ごとの取得スレッドとアルバムアートの取得スレッド。
-    // 枠を出す場所が無ければどちらも起こさない。
-    let mut melon = bar.melon_art_side().map(Melon::spawn);
+    // `[melon]` が無い・枠を出す場所が無ければどちらも起こさない。
+    let mut melon = None;
+    sync_melon(&mut melon, &bar);
 
     // 動いている claude。Claude Code の hooks が `task-var hook-*` 経由で送ってくる。
     let clawd_model: Arc<Mutex<clawd::Model>> = Arc::new(Mutex::new(clawd::Model::default()));
@@ -675,6 +708,7 @@ fn daemon() -> Result<()> {
                         if let Some(b) = reload_icons(&bar, &icons_path, screen_w, bar_h) {
                             bar = b;
                             icons_stamp = bar.icons().stamp(&icons_path);
+                            sync_melon(&mut melon, &bar);
                             // アイコンの位置が動くので、次の描画で全面を描き直す
                             full_now = true;
                         }

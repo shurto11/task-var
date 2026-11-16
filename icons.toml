@@ -1,4 +1,4 @@
-# task-var のアイコン列の定義。
+# task-var のアイコン列(と再生情報パネル・Melon 枠)の定義。
 #
 # 保存すると 1 秒以内にバーへ反映される(task-var の再起動もビルドも要らない)。
 # 書き間違いがあれば反映せず、前の定義のまま動き続ける。理由はログ
@@ -69,3 +69,19 @@ command = "env -u TMUX ~/ssd/drmterm/target/release/drmterm"
 name = "spotify"
 image = "assets/spotify.svg"
 command = "~/ssd/tui/spotatui/target/release/spotatui"
+
+# Melon 枠(clawd 枠とアイコン列の間)。追っている曲の Melon TOP100 順位を出す。
+# この節を丸ごとコメントアウトすると Melon 枠が消え、空いたぶんは clawd 枠が使う
+# (順位の取得も止まる)。戻せばまた出る。
+#
+#   image … 札に置くロゴ。商標なのでリポジトリには含めず、
+#           scripts/fetch-melon-logo.sh で落とす(読めなければ札は白地だけ)
+#   songs … 追う曲の Melon の songId(melon.com の曲ページの URL にある
+#           songId=… の数字)。書いた順に左から並ぶ
+# [melon]
+# image = "assets/melon.png"
+# songs = [
+#   "603442244", # NMIXX「긴 소원 (Birthday Wish)」
+#   "601879407", # NMIXX「Heavy Serenade」
+#   "600243411", # NMIXX「Blue Valentine」
+# ]

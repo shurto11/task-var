@@ -12,15 +12,12 @@
 //! 出るまで短い間隔で取り直す。
 //!
 //! 取得はアルバムアートと同じく curl のサブプロセスで行う(art.rs 参照)。
+//! 追う曲は icons.toml の `[melon]` に書く(actions.rs)。
 
 use serde::Deserialize;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-/// 既定で追う曲(Melon の songId)。並びが枠に左から並べる順番。
-/// NMIXX「긴 소원 (Birthday Wish)」「Heavy Serenade」「Blue Valentine」。
-/// `TASKVAR_MELON_SONGS`(カンマ区切り)で変えられる。
-const SONG_IDS: [&str; 3] = ["603442244", "601879407", "600243411"];
 const BASE: &str = "https://guyso.me/chart/melon/top100/trend/ranking";
 /// UA が無いと弾かれる。
 const UA: &str = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko)";
@@ -88,30 +85,26 @@ impl Chart {
     }
 }
 
-/// 追う曲の一覧。`TASKVAR_MELON_SONGS`(カンマ区切り)が無ければ `SONG_IDS`。
-fn songs() -> Vec<String> {
-    let from_env = std::env::var("TASKVAR_MELON_SONGS").ok().map(|v| {
-        v.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect::<Vec<_>>()
-    });
-    match from_env {
-        Some(v) if !v.is_empty() => v,
-        _ => SONG_IDS.iter().map(|s| s.to_string()).collect(),
-    }
-}
-
-/// 取得スレッドを起動する(detached)。どれかの曲が新しく取れるたびに、
-/// 取れている曲を追う順に並べて `shared` へ置く(1 度も取れていない曲は抜ける)。
-pub fn spawn(shared: Arc<Mutex<Option<Vec<Chart>>>>) {
-    let songs = songs();
+/// `songs`(Melon の songId。並びが枠に左から並べる順番)を追う取得スレッドを
+/// 起動する(detached)。どれかの曲が新しく取れるたびに、取れている曲を追う順に
+/// 並べて `shared` へ置く(1 度も取れていない曲は抜ける)。
+///
+/// スレッドは `shared` を弱く持つだけで、持ち主(main の Melon 枠)が捨てられたら
+/// (icons.toml で `[melon]` を消した・曲を変えた)次に起きたところで終わる。
+pub fn spawn(songs: Vec<String>, shared: &Arc<Mutex<Option<Vec<Chart>>>>) {
+    let shared = Arc::downgrade(shared);
     std::thread::spawn(move || {
         let mut charts: Vec<Option<Chart>> = vec![None; songs.len()];
-        loop {
+        while shared.strong_count() > 0 {
             let hour = (now_unix() + KST_OFFSET).div_euclid(3600);
             let (mut changed, mut failed) = (false, false);
             for (song, slot) in songs.iter().zip(charts.iter_mut()) {
                 // 今の時台まで取れている曲は取り直さない
                 if slot.as_ref().is_some_and(|c| is_current(c, hour)) {
                     continue;
+                }
+                if shared.strong_count() == 0 {
+                    return;
                 }
                 match fetch(song) {
                     Some(c) => {
@@ -131,6 +124,7 @@ pub fn spawn(shared: Arc<Mutex<Option<Vec<Chart>>>>) {
                 }
             }
             if changed {
+                let Some(shared) = shared.upgrade() else { return };
                 *shared.lock().unwrap() = Some(charts.iter().flatten().cloned().collect());
             }
             // いちばん遅れている曲に合わせて次を決める(取れていない曲があれば None)
