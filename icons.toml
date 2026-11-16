@@ -38,6 +38,11 @@ name = "fbrowse"
 image = "assets/fbrowse.svg"
 command = "~/ssd/fb/fbrowse/target/release/fbrowse --auto"
 
+[[icon]]
+name = "fbservo"
+image = "assets/fbservo.svg"
+command = "~/ssd/fb/fbservo/target/release/fbservo"
+
 # eduroam は ~/.bashrc の関数(sudo wpa_supplicant ...)なので、対話 bash 経由で呼ぶ
 [[icon]]
 name = "eduroam"
