@@ -12,7 +12,9 @@ fn run(args: &[&str]) -> Option<String> {
     Some(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
-fn run_checked(args: &[&str]) -> Result<()> {
+/// tmux コマンドを実行する。`;` を 1 つの引数として挟めば、複数のコマンドを
+/// 1 回の呼び出しで続けて実行できる。
+pub fn run_checked(args: &[&str]) -> Result<()> {
     let out = Command::new("tmux").args(args).output().context("tmux 実行失敗")?;
     if !out.status.success() {
         bail!("tmux {} 失敗: {}", args.join(" "), String::from_utf8_lossy(&out.stderr).trim());
@@ -32,6 +34,9 @@ pub struct State {
     /// 存在するセッションのうち最も古い(作成が最初の)もの。
     /// アイコン起動セッションがプログラム終了で破棄されたときの復帰先に使う。
     pub first_session: Option<String>,
+    /// fbterm クライアントがいま引いているキーテーブル(普段は "root"、Ctrl+b の直後は
+    /// "prefix")。ヒントのラベルを出したまま取り残されていないかの確認に使う。
+    pub key_table: Option<String>,
 }
 
 impl State {
@@ -50,25 +55,37 @@ impl State {
             st.first_session = sessions.first().map(|(_, name)| name.clone());
             st.existing = sessions.into_iter().map(|(_, name)| name).collect();
         }
-        if let Some((name, session)) = fbterm_client() {
-            st.client = Some(name);
-            st.current = Some(session);
+        if let Some(c) = fbterm_client() {
+            st.client = Some(c.name);
+            st.current = Some(c.session);
+            st.key_table = Some(c.key_table);
         }
         st
     }
 }
 
-/// fbterm 上の tmux クライアントを探して (client_name, client_session) を返す。
+/// fbterm 上の tmux クライアント。
+struct Client {
+    name: String,
+    session: String,
+    key_table: String,
+}
+
+/// fbterm 上の tmux クライアントを探す。
 /// SSH クライアントは対象にしない(term.rs の探索と同じ方針)。
-fn fbterm_client() -> Option<(String, String)> {
-    let out = run(&["list-clients", "-F", "#{client_name}\t#{client_termname}\t#{client_session}"])?;
+fn fbterm_client() -> Option<Client> {
+    let out = run(&[
+        "list-clients",
+        "-F",
+        "#{client_name}\t#{client_termname}\t#{client_session}\t#{client_key_table}",
+    ])?;
     let clients: Vec<Vec<&str>> =
-        out.lines().map(|l| l.split('\t').collect()).filter(|f: &Vec<&str>| f.len() == 3).collect();
+        out.lines().map(|l| l.split('\t').collect()).filter(|f: &Vec<&str>| f.len() == 4).collect();
     let pick = clients
         .iter()
         .find(|f| f[1].starts_with("fbterm") || f[1] == "linux")
         .or(if clients.len() == 1 { clients.first() } else { None })?;
-    Some((pick[0].to_string(), pick[2].to_string()))
+    Some(Client { name: pick[0].to_string(), session: pick[2].to_string(), key_table: pick[3].to_string() })
 }
 
 /// fbterm クライアントの表示をセッションへ切り替える。

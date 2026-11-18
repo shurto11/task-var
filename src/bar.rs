@@ -25,6 +25,7 @@
 use crate::actions::{Icon, Icons};
 use crate::art::Accent;
 use crate::clawd::{Row, St};
+use crate::hint;
 use crate::icons::{self, Glyph, Logo};
 use crate::melon::{Chart, Move};
 use crate::mpris::{Ctrl, Loop, PlayerState};
@@ -215,6 +216,14 @@ const MELON_STACK_GAP: f32 = 6.0;
 const MELON_UP: [u8; 3] = [0x5E, 0x4D, 0xFF]; // #FF4D5E
 const MELON_DOWN: [u8; 3] = [0xFF, 0xA8, 0x6A]; // #6AA8FF
 const MELON_NEW: [u8; 3] = [0x3C, 0xCD, 0x00]; // #00CD3C Melon グリーン
+
+// ヒントのラベル札(Ctrl+b f)。色は fbservo のリンクヒントと揃える。
+const HINT_BG: [u8; 3] = [0x00, 0xCC, 0xFF]; // #FFCC00
+const HINT_FG: [u8; 3] = [0, 0, 0];
+/// 札の高さ(白円の直径に対する割合)。
+const HINT_H_PCT: u32 = 52;
+/// 文字の大きさ(札の高さに対する割合)。
+const HINT_TEXT_PCT: f32 = 0.78;
 
 fn env_u32(name: &str, default: u32) -> u32 {
     std::env::var(name).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
@@ -809,6 +818,7 @@ impl Bar {
     }
 
     /// バー全体を buf(w*h*4 BGRA)へ描画する。`melon` が None なら Melon 枠は札だけ。
+    /// `hints` ならアイコンにヒントのラベルを重ねる(Ctrl+b f)。
     pub fn draw(
         &self,
         buf: &mut [u8],
@@ -816,6 +826,7 @@ impl Bar {
         np: Option<&NpView>,
         melon: Option<&MelonView>,
         clawd: Option<&ClawdView>,
+        hints: bool,
     ) {
         for px in buf.chunks_exact_mut(4) {
             px.copy_from_slice(&[BG[0], BG[1], BG[2], 0]);
@@ -827,6 +838,14 @@ impl Bar {
         }
         for (i, icon) in self.icons.list.iter().enumerate() {
             self.draw_tile(buf, self.xs[i], mark(icon, &self.icons, state), &self.glyphs[i]);
+        }
+        // 札は隣の円にはみ出すことがあるので、円を全部描いてから重ねる
+        if hints {
+            for (i, &x0) in self.xs.iter().enumerate() {
+                if let Some(c) = hint::label(i) {
+                    self.draw_hint(buf, x0, c);
+                }
+            }
         }
         match np {
             Some(view) => self.draw_np(buf, view),
@@ -956,6 +975,32 @@ impl Bar {
         let mw = (d * pct / 100).max(MARK_H);
         let rect = Rect { x: x0 + (d - mw) / 2, y: self.mark_y, w: mw, h: MARK_H };
         round_rect(buf, self.w, self.h, rect, MARK_H as f32 / 2.0, color);
+    }
+
+    /// ヒントのラベル札。fbservo / Vimium のリンクヒントと同じく、黄色の札を
+    /// 白円の左上に重ねる。グリフは隠さないので、どのアイコンの札かは見て分かる。
+    fn draw_hint(&self, buf: &mut [u8], x0: u32, label: char) {
+        let Some(font) = &self.font else { return };
+        let h = (self.tile_d * HINT_H_PCT / 100).max(10);
+        let px = h as f32 * HINT_TEXT_PCT;
+        let text = label.to_ascii_uppercase().to_string();
+        let tw = font.width(&text, px).ceil() as u32;
+        // 1 文字なので正方形に寄せる(`;` のような細い字でも札の大きさを揃える)
+        let w = (tw + h / 3).max(h);
+        // 円の左上の縁に掛かるよう、外へ少しはみ出させる
+        let rect = Rect {
+            x: x0.saturating_sub(h / 4),
+            y: self.tile_y.saturating_sub(h / 4),
+            w,
+            h,
+        };
+        round_rect_shadow(buf, self.w, self.h, rect, h as f32 / 4.0);
+        round_rect(buf, self.w, self.h, rect, h as f32 / 4.0, HINT_BG);
+        let tx = rect.x as f32 + (w as f32 - font.width(&text, px)) / 2.0;
+        let base = rect.y as f32 + h as f32 / 2.0 + px * 0.35;
+        // 黄地に細字は読みにくいので、1px ずらして重ね書きして太らせる
+        font.draw(buf, self.w, self.h, tx, base, px, HINT_FG, &text);
+        font.draw(buf, self.w, self.h, tx + 1.0, base, px, HINT_FG, &text);
     }
 
     /// パネルの下地。枠線の角丸矩形の内側を 1px 詰めて塗る。
@@ -1485,6 +1530,7 @@ mod tests {
             current: Some(current.into()),
             existing: existing.iter().map(|s| s.to_string()).collect(),
             first_session: existing.first().map(|s| s.to_string()),
+            key_table: Some("root".into()),
         }
     }
 
@@ -1595,16 +1641,48 @@ mod tests {
         // アイコン無し: 列が空になるだけ
         let bar = Bar::new(w, h, Icons::parse(spotify, base).unwrap()).unwrap();
         assert!(bar.xs.is_empty());
-        bar.draw(&mut buf, &state("main", &["main"]), None, None, None);
+        bar.draw(&mut buf, &state("main", &["main"]), None, None, None, false);
 
         // 画像が読めないアイコンは白円だけで残り、押せば当たる
         let one = format!("[[icon]]\nname = \"x\"\nimage = \"none.png\"\ncommand = \"true\"\n{spotify}");
         let bar = Bar::new(w, h, Icons::parse(&one, base).unwrap()).unwrap();
-        bar.draw(&mut buf, &state("main", &["main"]), None, None, None);
+        bar.draw(&mut buf, &state("main", &["main"]), None, None, None, false);
         let (cx, cy) = (bar.xs[0] + bar.tile_d / 2, bar.tile_y + bar.tile_d / 2);
         let off = ((cy * w + cx) * 4) as usize;
         assert_eq!(buf[off..off + 3], WHITE, "白円の真ん中は白のまま");
         assert_eq!(bar.hit(cx as f64, cy as f64, false, 0, false), Some(Hit::Icon(0)));
+    }
+
+    #[test]
+    fn hints_put_a_yellow_label_on_each_icon() {
+        // Ctrl+b f のラベル札は白円の左上に重なり、消すと跡形も無く元に戻る
+        if Font::load().is_none() {
+            eprintln!("フォントが無い環境なのでスキップ(札は文字が無いと出さない)");
+            return;
+        }
+        let (w, h) = (1366, 64);
+        let bar = Bar::new(w, h, icons()).unwrap();
+        let st = state("main", &["main"]);
+        let mut plain = vec![0u8; (w * h * 4) as usize];
+        let mut hinted = plain.clone();
+        bar.draw(&mut plain, &st, None, None, None, false);
+        bar.draw(&mut hinted, &st, None, None, None, true);
+
+        let px = |buf: &[u8], x: u32, y: u32| {
+            let off = ((y * w + x) * 4) as usize;
+            [buf[off], buf[off + 1], buf[off + 2]]
+        };
+        for &x0 in &bar.xs {
+            // 札の右下の内側(文字から外れた所)は黄色。円の中心(グリフ)は隠さない
+            let bh = bar.tile_d * HINT_H_PCT / 100;
+            let (bx, by) = (x0 - bh / 4 + 2, bar.tile_y.saturating_sub(bh / 4) + bh - 3);
+            assert_eq!(px(&hinted, bx, by), HINT_BG, "x0={x0} に札が無い");
+            let (cx, cy) = (x0 + bar.tile_d / 2, bar.tile_y + bar.tile_d / 2);
+            assert_eq!(px(&hinted, cx, cy), px(&plain, cx, cy), "札がグリフに掛かっている");
+        }
+        // パネルや clawd 枠には何も足さない
+        let r = bar.np_rect();
+        assert_eq!(px(&hinted, r.x + r.w / 2, r.y + r.h / 2), px(&plain, r.x + r.w / 2, r.y + r.h / 2));
     }
 
     #[test]
@@ -1629,8 +1707,8 @@ mod tests {
             let melon = melon_view(&charts, None);
             // 札だけ(None)と広げたところの両方を描ける
             let st = state("main", &["main"]);
-            bar.draw(&mut buf, &st, Some(&view), None, Some(&clawd));
-            bar.draw(&mut buf, &st, Some(&view), Some(&melon), Some(&clawd));
+            bar.draw(&mut buf, &st, Some(&view), None, Some(&clawd), false);
+            bar.draw(&mut buf, &st, Some(&view), Some(&melon), Some(&clawd), false);
 
             // 白円 + 下線はバーの中に収まる
             assert!(bar.mark_y + MARK_H <= h, "h={h} で下線がバーの外");
@@ -1683,7 +1761,7 @@ mod tests {
             art: art.as_deref(),
             accent: art.as_deref().map(crate::art::accent).unwrap_or_default(),
         };
-        bar.draw(&mut buf, &st, Some(&view), None, None);
+        bar.draw(&mut buf, &st, Some(&view), None, None, false);
 
         let px = |buf: &[u8], x: u32, y: u32| -> [u8; 3] {
             let off = ((y * w + x) * 4) as usize;
@@ -1799,7 +1877,7 @@ mod tests {
             .map(|(i, (s, st))| Row { pane: format!("%{i}"), label: s.to_string(), st: *st })
             .collect::<Vec<_>>();
             let clawd = ClawdView { rows: &clawd_rows, phase: false };
-            bar.draw(&mut buf, &st, Some(&view), None, Some(&clawd));
+            bar.draw(&mut buf, &st, Some(&view), None, Some(&clawd), false);
             let dump = |buf: &[u8], to: &str| {
                 let mut ppm = format!("P6\n{w} {h}\n255\n").into_bytes();
                 for p in buf.chunks_exact(4) {
@@ -1828,7 +1906,7 @@ mod tests {
                 ..melon_view(&charts, melon_art.as_deref())
             };
             let clawd = ClawdView { rows: &clawd_rows, phase: true };
-            bar.draw(&mut buf, &st, Some(&off), Some(&melon), Some(&clawd));
+            bar.draw(&mut buf, &st, Some(&off), Some(&melon), Some(&clawd), false);
             dump(&buf, &format!("{path}.off"));
         }
     }
@@ -1838,7 +1916,7 @@ mod tests {
         let (w, h) = (1366u32, 96u32);
         let bar = Bar::new(w, h, icons()).unwrap();
         let mut buf = vec![0u8; (w * h * 4) as usize];
-        bar.draw(&mut buf, &state("spotify", &["spotify"]), None, None, None);
+        bar.draw(&mut buf, &state("spotify", &["spotify"]), None, None, None, false);
         let px = |x: u32, y: u32| -> [u8; 3] {
             let off = ((y * w + x) * 4) as usize;
             [buf[off], buf[off + 1], buf[off + 2]]
@@ -1952,7 +2030,7 @@ mod tests {
             Row { pane: "%1".into(), label: "main".into(), st: St::Run },
             Row { pane: "%2".into(), label: "task-var".into(), st: St::Done },
         ];
-        bar.draw(&mut buf, &st, None, None, Some(&ClawdView { rows: &rows, phase: false }));
+        bar.draw(&mut buf, &st, None, None, Some(&ClawdView { rows: &rows, phase: false }), false);
 
         let px = |buf: &[u8], x: u32, y: u32| -> [u8; 3] {
             let off = ((y * w + x) * 4) as usize;
@@ -2005,7 +2083,7 @@ mod tests {
         // 1 つも無ければ場所ごと地色のまま(枠を持たないので何も残らない)。
         // 場所は `ClawdLayout` が確保したままなのでタップ先はずれない
         let mut empty = vec![0u8; (w * h * 4) as usize];
-        bar.draw(&mut empty, &st, None, None, Some(&ClawdView { rows: &[], phase: false }));
+        bar.draw(&mut empty, &st, None, None, Some(&ClawdView { rows: &[], phase: false }), false);
         assert!(
             (l.panel.x..l.panel.x + l.panel.w)
                 .all(|x| (l.panel.y..l.panel.y + l.panel.h).all(|y| px(&empty, x, y) == BG)),
@@ -2027,7 +2105,7 @@ mod tests {
         };
         let draw = |rows: &[Row]| {
             let mut buf = vec![0u8; (w * h * 4) as usize];
-            bar.draw(&mut buf, &st, None, None, Some(&ClawdView { rows, phase: false }));
+            bar.draw(&mut buf, &st, None, None, Some(&ClawdView { rows, phase: false }), false);
             buf
         };
         // その段(セルの高さ)の x0..x1 に何か描かれているか
@@ -2188,7 +2266,7 @@ mod tests {
             let off = ((y * w + x) * 4) as usize;
             [buf[off], buf[off + 1], buf[off + 2]]
         };
-        bar.draw(&mut buf, &state("main", &["main"]), None, None, None);
+        bar.draw(&mut buf, &state("main", &["main"]), None, None, None, false);
         // 白地の札。ロゴの外側は白のまま、札の外(clawd 枠との間)は地色
         assert_eq!(px(&buf, p.x + 4, mid), WHITE);
         assert_eq!(px(&buf, p.x + p.w - 4, mid), WHITE);
@@ -2241,7 +2319,7 @@ mod tests {
 
         // 札は描かれない(札の真ん中が白くならない)
         let mut buf = vec![0u8; (w * h * 4) as usize];
-        bar.draw(&mut buf, &state("main", &["main"]), None, None, None);
+        bar.draw(&mut buf, &state("main", &["main"]), None, None, None, false);
         let off = ((p.y + p.h / 2) * w + p.x + 4) as usize * 4;
         assert_ne!(buf[off..off + 3], WHITE);
     }
@@ -2300,10 +2378,10 @@ mod tests {
         view.songs[1].art = Some(&red_art);
         let rows = vec![Row { pane: "%1".into(), label: "main".into(), st: St::Run }];
         let clawd = ClawdView { rows: &rows, phase: false };
-        bar.draw(&mut buf, &st, None, Some(&view), Some(&clawd));
+        bar.draw(&mut buf, &st, None, Some(&view), Some(&clawd), false);
         // clawd 枠は広げた枠の下に隠れて描かれない(clawd を渡さないときと同じ絵)
         let mut without = vec![0u8; buf.len()];
-        bar.draw(&mut without, &st, None, Some(&view), None);
+        bar.draw(&mut without, &st, None, Some(&view), None, false);
         assert!(buf == without, "広げた枠の上に clawd が描かれている");
 
         let time_w = font.width(&view.time, l.sub_px).ceil() as u32;
@@ -2344,7 +2422,7 @@ mod tests {
 
         // まだ 1 曲も取れていなければ枠だけ。文字やアートのような明るいピクセルは無い
         let empty = MelonView { open: true, songs: Vec::new(), time: String::new() };
-        bar.draw(&mut buf, &st, None, Some(&empty), None);
+        bar.draw(&mut buf, &st, None, Some(&empty), None, false);
         let bright = |c: [u8; 3]| c.iter().all(|&v| v >= 150);
         assert!(
             !any_in(&buf, o.x + PAD, right, o.y + 4, o.y + o.h - 4, &bright),

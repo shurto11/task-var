@@ -74,7 +74,8 @@ fn socket_path() -> String {
 
 /// touch-client スレッドを起動する(detached)。切断・接続失敗時は再接続し続ける。
 /// `region` は共有。main が書き換えると張り直して新しい矩形で申告し直す。
-pub fn spawn(region: Arc<Mutex<FracRect>>, priority: i32, tx: Sender<Up>) {
+/// タッチは main のイベント型(`From<Up>`)に包んで送る。
+pub fn spawn<T: From<Up> + Send + 'static>(region: Arc<Mutex<FracRect>>, priority: i32, tx: Sender<T>) {
     std::thread::spawn(move || loop {
         match session(&region, priority, &tx) {
             Err(e) => {
@@ -88,7 +89,11 @@ pub fn spawn(region: Arc<Mutex<FracRect>>, priority: i32, tx: Sender<Up>) {
 }
 
 /// 1 接続ぶんの受信ループ。EOF / エラー / region 変更で戻る(呼び出し側が張り直す)。
-fn session(region: &Arc<Mutex<FracRect>>, priority: i32, tx: &Sender<Up>) -> std::io::Result<()> {
+fn session<T: From<Up>>(
+    region: &Arc<Mutex<FracRect>>,
+    priority: i32,
+    tx: &Sender<T>,
+) -> std::io::Result<()> {
     let declared = *region.lock().unwrap();
     let stream = UnixStream::connect(socket_path())?;
     let hello = Hello {
@@ -113,7 +118,7 @@ fn session(region: &Arc<Mutex<FracRect>>, priority: i32, tx: &Sender<Up>) -> std
                     let l: Vec<u8> = buf.drain(..=pos).collect();
                     if let Some(ev) = parse(&l) {
                         // 受信側(main)が落ちていたら終了
-                        if tx.send(ev).is_err() {
+                        if tx.send(ev.into()).is_err() {
                             return Ok(());
                         }
                     }

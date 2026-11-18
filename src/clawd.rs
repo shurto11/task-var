@@ -14,13 +14,13 @@
 //! - 枠に収まらない(既定 4 行を超える)ときは、要対応(質問待ち → 終了)を
 //!   優先して選ぶ。並べる順は開始順のままなので、行が飛び回らない
 
-use crate::tmux;
+use crate::{hint, tmux};
 use anyhow::{Context, Result};
 use serde::Deserialize;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::{mpsc, Arc, Mutex};
 use std::time::Duration;
 
 /// hook コマンドとデーモンが話すソケット。
@@ -224,11 +224,17 @@ struct Msg {
     cmd: String,
     #[serde(default)]
     pane: Option<String>,
+    /// `hint` の中身(`on` / `off` / `pick a`)。
+    #[serde(default)]
+    arg: Option<String>,
 }
 
 /// hook からの通知を受けるソケットを開き、受信スレッドを起こす。
 /// ソケットを開けない場合はバーの他の機能を巻き添えにせず、警告だけ出す。
-pub fn spawn(model: Arc<Mutex<Model>>) {
+///
+/// 同じソケットで `task-var hint …`(キーボードでアイコンを選ぶヒントモード)も受け、
+/// `hint_tx` で main ループへ渡す(ループを待たせずに起こすため)。
+pub fn spawn<T: From<hint::Cmd> + Send + 'static>(model: Arc<Mutex<Model>>, hint_tx: mpsc::Sender<T>) {
     let sock = socket_path();
     let _ = std::fs::remove_file(&sock);
     let listener = match UnixListener::bind(&sock) {
@@ -264,6 +270,12 @@ pub fn spawn(model: Arc<Mutex<Model>>) {
                     }
                     let _ = (&stream).write_all(s.as_bytes());
                 }
+                "hint" => match msg.arg.as_deref().and_then(hint::Cmd::parse) {
+                    Some(cmd) => {
+                        let _ = hint_tx.send(cmd.into());
+                    }
+                    None => eprintln!("task-var: 知らない hint の指示: {:?}", msg.arg),
+                },
                 cmd => {
                     if let Some(pane) = msg.pane.as_deref() {
                         model.lock().unwrap().apply(cmd, pane);

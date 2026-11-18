@@ -75,6 +75,29 @@ command = "bluetoothctl"        # セッションを作ったときに実行す�
 色だけでなく長さでも差が付いているので、並んでいても一目で見分けられる。
 tmux アイコンだけは閉じることが無いので、常に水色か灰色のどちらかになる。
 
+#### キーボードで選ぶ(Ctrl+b f)
+
+fbservo / fbrowse のリンクヒントと同じ要領で、キーボードからもアイコンを選べる。
+`Ctrl+b f` で各アイコンの左上に黄色のラベルが出て、そのキーを押すとタップしたのと
+同じ動作をする。Esc かラベル以外のキーで取り消す。
+
+ラベルはホーム列をキーボードの並び順のまま左から振る(`a s d f g h j k l ;`、
+11 個目からは `q w e r …`)。キーの位置とアイコンの位置が揃うので、慣れれば
+ラベルを見ずに `Ctrl+b f d` のように打てる。スワイプ表示モードでバーを隠して
+いる間は、ラベルと一緒にバーも出す。
+
+task-var はキーボードを読めないので、キーは tmux のキーテーブル `taskvar` で受ける。
+入口は `~/.tmux.conf` に書く(既定の `f` = find-window を上書きする)。
+
+```tmux
+bind f run-shell -b '~/ssd/fb/touch/task-var/target/release/task-var hint on' \; switch-client -T taskvar
+```
+
+`taskvar` テーブルの中身(ラベルのキー → `hint pick`、Esc とそれ以外のキー →
+`hint off`)は task-var が起動時と icons.toml の読み直し時に自分で張り直すので、
+アイコンを増やしても `.tmux.conf` は触らなくてよい。ラベル以外のキーも
+テーブルで受けるので、取り消したキーがペインへ漏れることはない。
+
 ### 再生情報パネル(右)
 
 spotatui が `/tmp/spotatui_np.json` に書く情報を 2 行 3 列で表示する。
@@ -207,8 +230,9 @@ TASKVAR_BAR_H=88 scripts/restart.sh
 | `task-var` | デーモン(バーを描く本体) |
 | `task-var hook-start\|question\|answer\|stop\|end` | Claude Code の hooks から状態を送る |
 | `task-var status` | 今の clawd 行を表示する |
+| `task-var hint on\|off\|pick <ラベル>` | ヒントのラベルを出す・消す・選ぶ(tmux のキー割り当てから呼ぶ) |
 
-`hook-*` と `status` は `$XDG_RUNTIME_DIR/task-var.sock` へ 1 行送るだけの
+`hook-*` と `status` と `hint` は `$XDG_RUNTIME_DIR/task-var.sock` へ 1 行送るだけの
 軽量クライアント。デーモンが居なければ黙って諦める(hook がデーモンを
 起こすと画面が動いてしまうため、起動はしない)。
 
@@ -291,7 +315,7 @@ TASKVAR_BAR_H=88 scripts/restart.sh
 ## 開発
 
 ```bash
-cargo test        # 描画・レイアウト・当たり判定・icons.toml の検証まで含めて 51 本
+cargo test        # 描画・レイアウト・当たり判定・icons.toml の検証まで含めて 57 本
 cargo build --release && scripts/restart.sh
 ```
 

@@ -16,6 +16,9 @@
 //!   `[melon]` をコメントアウトすると枠ごと消える(取得も止まる)。
 //! - タッチ入力は touch-server から受け取る(バー矩形を region として申告)
 //! - アイコンタップで対応 tmux セッションへ遷移(なければ作成してプログラム実行)
+//! - キーボードでも選べる(hint.rs): Ctrl+b f でアイコンにラベル(a s d f …)が出て、
+//!   そのキーを押すとタップと同じ動作。キーは tmux のキーテーブルで受け、
+//!   `task-var hint …` がソケット経由でここへ届ける
 //! - 通常は端末行数を縮めてバー領域を専有し、終了時に復元する(touch-key と同方式)
 //! - 全画面クライアントのシーン(`SWIPE_SCENES`: fbhalf)の間は
 //!   「スワイプ表示モード」: 端末縮小を解除して全高を明け渡し、バーは既定で隠す。
@@ -35,6 +38,7 @@ mod bar;
 mod clawd;
 mod fb;
 mod fb_client;
+mod hint;
 mod icons;
 mod melon;
 mod mpris;
@@ -88,6 +92,25 @@ const FULL_BLIT_EVERY: Duration = Duration::from_secs(1);
 /// Melon 枠のアルバムアートのうち、取れなかった曲を後回しにして次の曲へ回す間隔
 /// (`Melon::refresh`)。
 const MELON_ART_TURN: Duration = Duration::from_secs(10);
+
+/// main ループが待ち受けるイベント。タッチ(touch-server)とヒントの指示
+/// (ソケット)を 1 本のチャネルで受け、どちらが来てもすぐ起きられるようにする。
+enum Ev {
+    Touch(touch_client::Up),
+    Hint(hint::Cmd),
+}
+
+impl From<touch_client::Up> for Ev {
+    fn from(up: touch_client::Up) -> Self {
+        Ev::Touch(up)
+    }
+}
+
+impl From<hint::Cmd> for Ev {
+    fn from(cmd: hint::Cmd) -> Self {
+        Ev::Hint(cmd)
+    }
+}
 
 fn env_u32(name: &str, default: u32) -> u32 {
     std::env::var(name).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
@@ -271,6 +294,7 @@ fn sync_melon(melon: &mut Option<Melon>, bar: &Bar) {
 /// 進捗バーの部分ブリットの判断に使う。
 ///
 /// 行は当たり判定と部分ブリットの判断にも要るので、描いたものをそのまま返す。
+#[allow(clippy::too_many_arguments)]
 fn redraw(
     bar: &Bar,
     buf: &mut [u8],
@@ -279,11 +303,13 @@ fn redraw(
     melon: Option<&Melon>,
     clawd: &Arc<Mutex<clawd::Model>>,
     phase: bool,
+    hints: bool,
 ) -> (bool, Vec<Row>) {
     let view = np.view();
     let chart = melon.map(Melon::view);
     let rows = clawd.lock().unwrap().rows(bar.clawd_cells());
-    bar.draw(buf, state, view.as_ref(), chart.as_ref(), Some(&ClawdView { rows: &rows, phase }));
+    let clawd = ClawdView { rows: &rows, phase };
+    bar.draw(buf, state, view.as_ref(), chart.as_ref(), Some(&clawd), hints);
     (view.is_some(), rows)
 }
 
@@ -306,7 +332,9 @@ fn sub_rect(buf: &[u8], buf_w: u32, r: bar::Rect) -> Vec<u8> {
 fn main() -> Result<()> {
     // 引数なしはデーモン。hook-* は Claude Code の hooks から呼ばれる通知クライアントで、
     // ソケットへ 1 行送るだけで即戻る(旧 touch-claude の hook コマンド)。
-    match std::env::args().nth(1).as_deref() {
+    // hint は tmux のキー割り当て(Ctrl+b f)から呼ばれ、同じくソケットへ送るだけ。
+    let args: Vec<String> = std::env::args().collect();
+    match args.get(1).map(String::as_str) {
         None => daemon(),
         Some("hook-start") => clawd::notify("start"),
         Some("hook-question") => clawd::notify("question"),
@@ -314,10 +342,12 @@ fn main() -> Result<()> {
         Some("hook-stop") => clawd::notify("stop"),
         Some("hook-end") => clawd::notify("end"),
         Some("status") => clawd::status(),
+        Some("hint") => hint::notify(&args[2..]),
         Some(other) => {
             eprintln!(
                 "task-var: 未知のサブコマンド {other:?}\n\
-                 usage: task-var [hook-start|hook-question|hook-answer|hook-stop|hook-end|status]"
+                 usage: task-var [hook-start|hook-question|hook-answer|hook-stop|hook-end|status\
+                 |hint <on|off|pick ラベル>]"
             );
             std::process::exit(2);
         }
@@ -395,6 +425,10 @@ fn daemon() -> Result<()> {
     let icons_path = actions::Icons::path();
     let mut bar = Bar::new(screen_w, bar_h, actions::Icons::load_at_start(&icons_path))?;
     let mut icons_stamp = bar.icons().stamp(&icons_path);
+    // キーボードで選ぶためのキー(tmux の taskvar テーブル)を、アイコンの数に合わせて張る
+    hint::bind_keys(bar.icons().list.len());
+    // ヒントのラベルを出しているか(Ctrl+b f から、キーを 1 つ押すまで)
+    let mut hinting = false;
     let mut buf = vec![0u8; (screen_w * bar_h * 4) as usize];
     let mut state = tmux::State::poll();
 
@@ -410,13 +444,25 @@ fn daemon() -> Result<()> {
     let mut melon = None;
     sync_melon(&mut melon, &bar);
 
+    // タッチとヒントの指示を受けるチャネル(main ループはこれを待つ)。
+    let (tx, rx) = mpsc::channel::<Ev>();
+
     // 動いている claude。Claude Code の hooks が `task-var hook-*` 経由で送ってくる。
+    // 同じソケットでヒントの指示(`task-var hint …`)も受ける。
     let clawd_model: Arc<Mutex<clawd::Model>> = Arc::new(Mutex::new(clawd::Model::default()));
-    clawd::spawn(clawd_model.clone());
+    clawd::spawn(clawd_model.clone(), tx.clone());
     // 走りアニメーションの位相の基準時刻。
     let started = Instant::now();
-    let (mut ctrls_shown, mut rows) =
-        redraw(&bar, &mut buf, &state, &np, melon.as_ref(), &clawd_model, clawd_phase(started));
+    let (mut ctrls_shown, mut rows) = redraw(
+        &bar,
+        &mut buf,
+        &state,
+        &np,
+        melon.as_ref(),
+        &clawd_model,
+        clawd_phase(started),
+        hinting,
+    );
 
     // touch-server クライアント起動。バー表示中は帯全体、非表示中は下端だけを
     // region として申告する(残りは fbhalf 等が受け取れる)。優先度を付けて、
@@ -429,7 +475,6 @@ fn daemon() -> Result<()> {
     };
     let swipe_region = FracRect { left: 0.0, top: 1.0 - SWIPE_ZONE_FRAC, right: 1.0, bottom: 1.0 };
     let touch_region = Arc::new(Mutex::new(bar_region));
-    let (tx, rx) = mpsc::channel::<touch_client::Up>();
     touch_client::spawn(touch_region.clone(), TOUCH_PRIORITY, tx);
 
     // バーの表示状態に合わせてタッチ領域を切り替える。
@@ -555,7 +600,53 @@ fn daemon() -> Result<()> {
         };
 
         match rx.recv_timeout(timeout) {
-            Ok(up) => {
+            Ok(Ev::Hint(cmd)) => {
+                match cmd {
+                    hint::Cmd::On => hinting = true,
+                    hint::Cmd::Off => hinting = false,
+                    hint::Cmd::Pick(c) => {
+                        hinting = false;
+                        // 押した瞬間の状態で決める(1 秒前のポーリング結果だと、直前に
+                        // 開いたセッションを知らずに作り直そうとすることがある)
+                        state = tmux::State::poll();
+                        match hint::index(c).and_then(|i| bar.icons().list.get(i)) {
+                            Some(icon) => {
+                                eprintln!("task-var: ヒント {c} で {} を選択", icon.name);
+                                if let Err(e) = actions::activate(icon, &state) {
+                                    eprintln!("task-var: {} の起動に失敗: {e:#}", icon.name);
+                                }
+                            }
+                            None => eprintln!("task-var: ヒント {c} に当たるアイコンが無い"),
+                        }
+                    }
+                }
+                // スワイプ表示モードでバーを隠している間も、ラベルを出すときはバーごと出す。
+                // ラベルを出している間は隠さず、消えてから `HIDE_AFTER` で隠す
+                let reveal = swipe_mode && hinting && !bar_shown;
+                if swipe_mode {
+                    hide_at = Some(Instant::now() + HIDE_AFTER);
+                }
+                state = tmux::State::poll();
+                (ctrls_shown, rows) = redraw(
+                    &bar,
+                    &mut buf,
+                    &state,
+                    &np,
+                    melon.as_ref(),
+                    &clawd_model,
+                    clawd_phase(started),
+                    hinting,
+                );
+                if reveal {
+                    show_bar(&fb, &buf)?;
+                    bar_shown = true;
+                    last_full = Instant::now();
+                } else if bar_shown {
+                    fb.blit(0, bar_y, screen_w, bar_h, &buf)?;
+                    last_full = Instant::now();
+                }
+            }
+            Ok(Ev::Touch(up)) => {
                 let dx = up.fx1 - up.fx0;
                 let dy = up.fy1 - up.fy0;
                 let moved = dx.abs().max(dy.abs());
@@ -577,6 +668,7 @@ fn daemon() -> Result<()> {
                             melon.as_ref(),
                             &clawd_model,
                             clawd_phase(started),
+                            hinting,
                         );
                         show_bar(&fb, &buf)?;
                         bar_shown = true;
@@ -656,6 +748,7 @@ fn daemon() -> Result<()> {
                     melon.as_ref(),
                     &clawd_model,
                     clawd_phase(started),
+                    hinting,
                 );
                 if bar_shown {
                     fb.blit(0, bar_y, screen_w, bar_h, &buf)?;
@@ -664,7 +757,7 @@ fn daemon() -> Result<()> {
             }
             Err(mpsc::RecvTimeoutError::Timeout) | Err(mpsc::RecvTimeoutError::Disconnected) => {
                 // スワイプ表示の期限切れで自動的に隠す。
-                if swipe_mode && bar_shown && hide_at.is_some_and(|t| Instant::now() >= t) {
+                if swipe_mode && bar_shown && !hinting && hide_at.is_some_and(|t| Instant::now() >= t) {
                     hide_bar(&fb, true)?;
                     bar_shown = false;
                     hide_at = None;
@@ -698,6 +791,13 @@ fn daemon() -> Result<()> {
                         }
                         state = s;
                     }
+                    // ラベルを出したまま、fbterm クライアントが taskvar テーブルを抜けていたら
+                    // 消す(`hint off` を取りこぼした・SSH 側で Ctrl+b f を押した、など)
+                    if hinting && state.key_table.as_deref() != Some(hint::TABLE) {
+                        eprintln!("task-var: キーテーブルが {:?} に戻っていたのでヒントを消します", state.key_table);
+                        hinting = false;
+                        full_now = true;
+                    }
                     // 消えたペインの掃除とセッション名の更新も同じ間隔で行う。
                     clawd::refresh(&clawd_model);
 
@@ -706,6 +806,9 @@ fn daemon() -> Result<()> {
                     if stamp != icons_stamp {
                         icons_stamp = stamp;
                         if let Some(b) = reload_icons(&bar, &icons_path, screen_w, bar_h) {
+                            if b.icons().list.len() != bar.icons().list.len() {
+                                hint::bind_keys(b.icons().list.len());
+                            }
                             bar = b;
                             icons_stamp = bar.icons().stamp(&icons_path);
                             sync_melon(&mut melon, &bar);
@@ -728,6 +831,7 @@ fn daemon() -> Result<()> {
                     melon.as_ref(),
                     &clawd_model,
                     clawd_phase(started),
+                    hinting,
                 );
 
                 if bar_shown {
