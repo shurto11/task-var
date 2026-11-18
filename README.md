@@ -86,6 +86,11 @@ fbservo / fbrowse のリンクヒントと同じ要領で、キーボードか�
 ラベルを見ずに `Ctrl+b f d` のように打てる。スワイプ表示モードでバーを隠して
 いる間は、ラベルと一緒にバーも出す。
 
+icons.toml でアイコンに `hint_session = "<セッション名>"` を書くと、キーで選んだときだけ
+コマンドを実行せず、そのセッションで最後に開いていたウィンドウへ移る(既にそのセッションに
+居るなら直前のウィンドウへ。`Ctrl+b l` と同じ)。既定の定義では tmux アイコンに
+`hint_session = "0"` を付けてあり、タップなら tmux-session、`Ctrl+b f a` ならセッション 0 に戻る。
+
 task-var はキーボードを読めないので、キーは tmux のキーテーブル `taskvar` で受ける。
 入口は `~/.tmux.conf` に書く(既定の `f` = find-window を上書きする)。
 
@@ -315,7 +320,7 @@ TASKVAR_BAR_H=88 scripts/restart.sh
 ## 開発
 
 ```bash
-cargo test        # 描画・レイアウト・当たり判定・icons.toml の検証まで含めて 57 本
+cargo test        # 描画・レイアウト・当たり判定・icons.toml の検証まで含めて 58 本
 cargo build --release && scripts/restart.sh
 ```
 

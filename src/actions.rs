@@ -7,6 +7,9 @@
 //! - `window = true` のアイコン(tmux)は、常に表示中のセッションに新しいウィンドウを
 //!   開いてコマンドを実行する。
 //! - それ以外は「セッションがあれば switch のみ / なければ作成してコマンド実行 → switch」。
+//! - `hint_session` を書いたアイコンは、キーボード(Ctrl+b f、hint.rs)で選んだときだけ
+//!   コマンドを実行せず、そのセッションの最近開いていたウィンドウへ移る(`activate_by_key`)。
+//!   tmux アイコンを「タップなら tmux-session、キーならセッション 0 へ戻る」にするため。
 //! - Spotify は再生情報パネル(bar.rs)が受け持つので、アイコン列には並べず
 //!   `[spotify]` として別に持つ。パネルのタップとアート未取得時の絵がこれを引く。
 //! - Melon 枠(追っている曲の TOP100 順位)は `[melon]` に書く。節ごと無ければ
@@ -35,6 +38,8 @@ pub struct Icon {
     pub command: String,
     /// セッションを作らず、表示中のセッションに新しいウィンドウを開く。
     pub window: bool,
+    /// キーボードで選んだときは command を実行せず、このセッションへ移る。
+    pub hint_session: Option<String>,
 }
 
 impl Icon {
@@ -89,6 +94,8 @@ struct Entry {
     command: String,
     #[serde(default)]
     window: bool,
+    #[serde(default)]
+    hint_session: Option<String>,
 }
 
 /// `~/` を $HOME に、相対パスを base からのパスにする。
@@ -114,7 +121,18 @@ impl Icons {
             // tmux はセッション名の : と . を _ に置き換えるので、名前で照合できなくなる
             ensure!(!name.contains([':', '.']), "name に「:」「.」は使えない: {name}");
             ensure!(!e.command.trim().is_empty(), "{name} の command が空");
-            Ok(Icon { name, image: resolve(&e.image, base), command: e.command, window: e.window })
+            let hint_session = e.hint_session.map(|s| s.trim().to_string());
+            if let Some(s) = &hint_session {
+                ensure!(!s.is_empty(), "{name} の hint_session が空");
+                ensure!(!s.contains([':', '.']), "{name} の hint_session に「:」「.」は使えない: {s}");
+            }
+            Ok(Icon {
+                name,
+                image: resolve(&e.image, base),
+                command: e.command,
+                window: e.window,
+                hint_session,
+            })
         };
         let list = file.icon.into_iter().map(to_icon).collect::<Result<Vec<_>>>()?;
         let spotify = to_icon(file.spotify).context("[spotify]")?;
@@ -157,6 +175,7 @@ impl Icons {
                         image: PathBuf::new(),
                         command: "true".into(),
                         window: false,
+                        hint_session: None,
                     },
                     melon: None,
                 }
@@ -217,6 +236,51 @@ pub fn activate(icon: &Icon, state: &tmux::State) -> Result<()> {
     tmux::switch(client, session)
 }
 
+/// キーボードで選ばれたときに何をするか(`hint_session` の解釈)。
+#[derive(Debug, PartialEq, Eq)]
+enum KeyPick<'a> {
+    /// タップと同じ(`activate`)。
+    Activate,
+    /// ほかのセッションを見ているので、そのセッションへ移る。tmux はセッションごとに
+    /// 最後に開いていたウィンドウを覚えているので、そこへ戻る。
+    Switch(&'a str),
+    /// もうそのセッションに居るので、直前に開いていたウィンドウへ移る(Ctrl+b l と同じ)。
+    LastWindow(&'a str),
+}
+
+fn key_pick<'a>(icon: &'a Icon, state: &tmux::State) -> KeyPick<'a> {
+    let Some(sess) = icon.hint_session.as_deref() else { return KeyPick::Activate };
+    if !state.existing.iter().any(|s| s == sess) {
+        eprintln!("task-var: hint_session のセッション {sess} が無いので、タップと同じ動作にします");
+        return KeyPick::Activate;
+    }
+    if state.current.as_deref() == Some(sess) {
+        KeyPick::LastWindow(sess)
+    } else {
+        KeyPick::Switch(sess)
+    }
+}
+
+/// キーボード(Ctrl+b f)で選ばれたときの動作。`hint_session` が無ければタップと同じ。
+pub fn activate_by_key(icon: &Icon, state: &tmux::State) -> Result<()> {
+    let client = state.client.as_deref().context("fbterm の tmux クライアントが見つかりません")?;
+    match key_pick(icon, state) {
+        KeyPick::Activate => activate(icon, state),
+        KeyPick::Switch(sess) => {
+            eprintln!("task-var: セッション {sess} の最近のウィンドウへ切替");
+            tmux::switch_exact(client, sess)
+        }
+        KeyPick::LastWindow(sess) => {
+            eprintln!("task-var: セッション {sess} の直前のウィンドウへ切替");
+            // 直前のウィンドウが無い(ウィンドウが 1 つだけ等)なら、そのまま居ればよい
+            if let Err(e) = tmux::last_window(sess) {
+                eprintln!("task-var: 直前のウィンドウが無いので動きません: {e:#}");
+            }
+            Ok(())
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -264,6 +328,59 @@ mod tests {
         assert_eq!(icons.spotify.image, Path::new("/abs/spotify.svg"));
         assert_eq!(icons.sessions().collect::<Vec<_>>(), ["shorts", "spotify"]);
         assert_eq!(icons.melon, None, "[melon] が無ければ Melon 枠は出さない");
+    }
+
+    #[test]
+    fn hint_session_only_changes_what_the_keyboard_does() {
+        let icons = Icons::parse(
+            r#"
+            [[icon]]
+            name = "tmux"
+            image = "a.svg"
+            command = "tmux-session"
+            window = true
+            hint_session = " 0 "
+
+            [[icon]]
+            name = "wanna"
+            image = "a.svg"
+            command = "wanna"
+
+            [spotify]
+            name = "spotify"
+            image = "a.svg"
+            command = "spotatui"
+            "#,
+            Path::new("/"),
+        )
+        .unwrap();
+        let (tmux, wanna) = (&icons.list[0], &icons.list[1]);
+        assert_eq!(tmux.hint_session.as_deref(), Some("0"), "前後の空白は落とす");
+        assert_eq!(wanna.hint_session, None, "既定は無し");
+
+        let state = |current: &str| tmux::State {
+            client: Some("/dev/pts/1".into()),
+            current: Some(current.into()),
+            existing: vec!["0".into(), "wanna".into()],
+            ..Default::default()
+        };
+        // ほかのセッションからはセッション 0 へ(最後に開いていたウィンドウに戻る)
+        assert_eq!(key_pick(tmux, &state("wanna")), KeyPick::Switch("0"));
+        // セッション 0 に居るなら直前のウィンドウへ
+        assert_eq!(key_pick(tmux, &state("0")), KeyPick::LastWindow("0"));
+        // hint_session が無ければタップと同じ
+        assert_eq!(key_pick(wanna, &state("0")), KeyPick::Activate);
+        // セッション 0 が無ければタップと同じ(tmux-session を開く)
+        let gone = tmux::State { existing: vec!["wanna".into()], ..state("wanna") };
+        assert_eq!(key_pick(tmux, &gone), KeyPick::Activate);
+
+        let err = |v: &str| {
+            let text = format!("[[icon]]\nname = \"a\"\nimage = \"a.svg\"\ncommand = \"x\"\nhint_session = {v}\n[spotify]\nname = \"spotify\"\nimage = \"a.svg\"\ncommand = \"x\"\n");
+            format!("{:#}", Icons::parse(&text, Path::new("/")).unwrap_err())
+        };
+        assert!(err("\" \"").contains("空"));
+        assert!(err("\"0:1\"").contains("0:1"));
+        assert!(err("0").contains("hint_session"), "数値ではなく文字列で書く");
     }
 
     #[test]

@@ -93,6 +93,18 @@ pub fn switch(client: &str, session: &str) -> Result<()> {
     run_checked(&["switch-client", "-c", client, "-t", session])
 }
 
+/// fbterm クライアントの表示をセッションへ切り替える。名前が数字だけのセッション
+/// ("0" など)でも取り違えないよう、完全一致(`=名前`)で指す。表示されるのは
+/// そのセッションで最後に開いていたウィンドウ。
+pub fn switch_exact(client: &str, session: &str) -> Result<()> {
+    run_checked(&["switch-client", "-c", client, "-t", &format!("={session}")])
+}
+
+/// セッションの表示を直前に開いていたウィンドウへ移す(Ctrl+b l と同じ)。
+pub fn last_window(session: &str) -> Result<()> {
+    run_checked(&["last-window", "-t", &format!("={session}")])
+}
+
 /// デタッチ状態で新規セッションを作り、コマンドを実行する(cmd はシェル経由)。
 ///
 /// 作成したセッション単体に detach-on-destroy off を設定する。既定(on)だと

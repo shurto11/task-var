@@ -612,7 +612,7 @@ fn daemon() -> Result<()> {
                         match hint::index(c).and_then(|i| bar.icons().list.get(i)) {
                             Some(icon) => {
                                 eprintln!("task-var: ヒント {c} で {} を選択", icon.name);
-                                if let Err(e) = actions::activate(icon, &state) {
+                                if let Err(e) = actions::activate_by_key(icon, &state) {
                                     eprintln!("task-var: {} の起動に失敗: {e:#}", icon.name);
                                 }
                             }

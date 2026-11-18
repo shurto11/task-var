@@ -17,16 +17,22 @@
 #   window  … (省略可)true にすると、セッションを作らず、いま表示している
 #             セッションに毎回新しいウィンドウを開いて command を実行する。
 #             下線は「ほかのアイコンのセッション以外を見ている間」が水色になる
+#   hint_session … (省略可)キーボード(Ctrl+b f)で選んだときだけ command を実行せず、
+#             このセッションへ移る。tmux は最後に開いていたウィンドウを覚えているので
+#             そこへ戻る。もうそのセッションに居るなら直前のウィンドウへ(Ctrl+b l と同じ)。
+#             セッションが無ければタップと同じ動作になる
 #
 # ブランドのアイコンは Simple Icons(https://simpleicons.org)の slug を使って
 #   curl -fsSL https://cdn.simpleicons.org/<slug> -o assets/<名前>.svg
 # で取れる。ブランドカラー付きの SVG が落ちてくるので、そのまま色付きで描ける。
 
+# タップなら tmux-session(スイッチャー)、Ctrl+b f a ならセッション 0 の最近のウィンドウへ
 [[icon]]
 name = "tmux"
 image = "assets/tmux.svg"
 command = "~/ssd/fb/tmux-session/target/release/tmux-session"
 window = true
+hint_session = "0"
 
 [[icon]]
 name = "bluetooth"
