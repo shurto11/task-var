@@ -34,6 +34,11 @@ image = "assets/bluetooth.svg"
 command = "bluetoothctl"
 
 [[icon]]
+name = "camera"
+image = "assets/camera.svg"
+command = "~/ssd/apps/fbcam/target/release/fbcam"
+
+[[icon]]
 name = "fbrowse"
 image = "assets/fbrowse.svg"
 command = "~/ssd/fb/fbrowse/target/release/fbrowse --auto"
